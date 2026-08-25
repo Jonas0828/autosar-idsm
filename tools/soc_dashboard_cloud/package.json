@@ -1,0 +1,13 @@
+{
+  "name": "idsm-soc-ingest",
+  "version": "1.0.0",
+  "description": "Vercel serverless ingest bridge for IDSM/IDSR SOC dashboard",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "npx vercel@latest dev",
+    "deploy": "npx vercel@latest --prod"
+  }
+}
