@@ -12,10 +12,11 @@ IdsM_Manager& IdsM_Manager::Instance() {
     return instance;
 }
 
-/* Background Worker Loop */
+/* Background worker loop — the MainFunction equivalent [SWS_IdsM_00901].
+   SEvs are qualified asynchronously here, never on the caller's thread. */
 void IdsM_Manager::worker_loop() {
     while (m_worker_running.load()) {
-        std::vector<IdsM_OwnedEvent> local_batch;
+        std::vector<IdsM_OwnedSEv> local_batch;
 
         // 1. Wait for events or shutdown signal
         {
@@ -26,77 +27,162 @@ void IdsM_Manager::worker_loop() {
 
             if (!m_worker_running.load() && m_incoming_queue.empty()) break;
 
-            // Drain queue into local batch
+            // Drain queue into local batch, decrement per-SEv pending counters
             while (!m_incoming_queue.empty()) {
+                auto& sev_id = m_incoming_queue.front().security_event_id;
+                if (sev_id < m_sevs.size() && m_sevs[sev_id].pending_count > 0) {
+                    m_sevs[sev_id].pending_count--;
+                }
                 local_batch.push_back(std::move(m_incoming_queue.front()));
                 m_incoming_queue.pop();
             }
         }
 
-        // 2. Process events (find monitor & buffer)
+        // 2. Qualify each event: reporting mode -> (filter chain) -> QSEv -> sinks
         for (auto& event : local_batch) {
             std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_monitors.find(event.monitor_id);
-
-            if (it != m_monitors.end() && it->second.active && isMonitorEnabledInMode(it->second)) {
-                it->second.status = IDSM_STATUS_VIOLATION;
-
-                IdsM_InternalEvent internal_evt{};
-                internal_evt.report = std::move(event);
-                internal_evt.first_seen_ns = getTimestampNs();
-                internal_evt.occurrence_count = 1;
-
-                if (it->second.event_buffer.size() >= it->second.config.event_buffer_size) {
-                    it->second.event_buffer.pop();
-                }
-                it->second.event_buffer.push(std::move(internal_evt));
-                // ✅ DO NOT set last_report_ns here!
-            }
+            processEvent(event);
         }
-
-        // 3. Process monitors (Flood protection & DEM forwarding)
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            uint64_t now_ns = getTimestampNs();
-            for (auto& [id, mon] : m_monitors) {
-                if (!mon.active || !isMonitorEnabledInMode(mon)) continue;
-
-                while (!mon.event_buffer.empty()) {
-                    auto& evt = mon.event_buffer.front();
-                    if (!isFloodProtected(mon, now_ns)) {
-                        forwardToDem(evt.report);
-                        mon.last_report_ns = now_ns; // ✅ SET ONLY AFTER SUCCESSFUL FORWARD
-                        mon.event_buffer.pop();
-                    } else {
-                        break; // Flood protection active, stop processing this monitor
-                    }
-                }
-            }
-        }
-
-        // Prevent 100% CPU usage
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 
-STD_RETURN_TYPE IdsM_Manager::Init(const IdsM_MonitorConfigType* config, uint16_t count) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!config && count > 0) return E_PARAM_POINTER;
-    
-    for (uint16_t i = 0; i < count; ++i) {
-        IdsM_InternalMonitor mon{};
-        mon.config = config[i];
-        mon.status = IDSM_STATUS_UNINITIALIZED;
-        mon.active = false;
-        m_monitors[config[i].monitor_id] = mon;
+/* Reporting mode evaluation [SWS_IdsM_01002/01013], then the filter chain in
+   the fixed order BlockState -> ForwardEveryNth [SWS_IdsM_01004] with
+   short-circuit drop [SWS_IdsM_01005], then qualification and sink dispatch. */
+void IdsM_Manager::processEvent(IdsM_OwnedSEv& sev) {
+    if (sev.security_event_id >= m_sevs.size()) return;
+    auto& state = m_sevs[sev.security_event_id];
+
+    const IdsM_Filters_ReportingModeType mode = state.reporting_mode;
+
+    if (mode == IDSM_REPORTING_OFF) {
+        m_stats.dropped_reporting_off++;
+        return;
     }
-    m_current_mode = IDSM_PRE_RUN_MODE;
+
+    const bool brief = (mode == IDSM_REPORTING_BRIEF) ||
+                       (mode == IDSM_REPORTING_BRIEF_BYPASSING_FILTERS);
+    const bool bypassing = (mode == IDSM_REPORTING_BRIEF_BYPASSING_FILTERS) ||
+                           (mode == IDSM_REPORTING_DETAILED_BYPASSING_FILTERS);
+
+    // Event accepted -> mark detection status
+    state.detection_status = IDSM_STATUS_VIOLATION;
+
+    // Filter chain (skipped entirely in the BYPASSING reporting modes)
+    if (!bypassing) {
+        if (isBlockedByState(state)) {
+            m_stats.dropped_block_state++;
+            return;
+        }
+        if (!passForwardEveryNth(state, sev.count)) {
+            m_stats.dropped_sampling++;
+            return;
+        }
+    }
+
+    // Build the QSEv
+    IdsM_OwnedQSEv qsev;
+    qsev.idsm_instance_id  = m_idsm_instance_id;
+    qsev.external_event_id = state.config.external_event_id;
+    qsev.sensor_instance_id = state.config.sensor_instance_id;
+    qsev.severity          = state.config.severity;
+    qsev.count             = sev.count;
+    qsev.has_timestamp     = true;
+    qsev.timestamp         = sev.has_timestamp ? sev.timestamp : makeInternalTimestamp();
+    qsev.context_data_version = sev.context_data_version;
+    if (!brief) {
+        qsev.context_data = std::move(sev.context_data);
+    }
+
+    m_stats.events_qualified++;
+    dispatchQsev(state, qsev);
+}
+
+/* Block State Filter [SWS_IdsM_01020-01024]: drop if the current block state
+   (set via IdsM_BswM_StateChanged) is in this SEv's blocked list. */
+bool IdsM_Manager::isBlockedByState(const IdsM_SevState& sev) const {
+    const auto* cfg = sev.config.block_state;
+    if (!cfg) return false;
+    for (uint8_t i = 0; i < cfg->num_blocked_states; ++i) {
+        if (cfg->blocked_states[i] == m_block_state) return true;
+    }
+    return false;
+}
+
+/* Forward Every Nth [SWS_IdsM_01030-01034]: the counter is initialized to n
+   (first SEv forwarded) and accumulates the SEv count values; on reaching or
+   exceeding n the SEv passes unmodified and the counter resets. */
+bool IdsM_Manager::passForwardEveryNth(IdsM_SevState& sev, uint16_t count) {
+    const uint16_t n = sev.config.forward_every_nth;
+    if (n == 0) return true;                       /* filter not configured */
+
+    uint32_t accumulated = static_cast<uint32_t>(sev.nth_counter) + count;
+    if (accumulated >= n) {
+        sev.nth_counter = 0;
+        return true;
+    }
+    sev.nth_counter = static_cast<uint16_t>(accumulated);
+    return false;
+}
+
+void IdsM_Manager::dispatchQsev(const IdsM_SevState& sev, const IdsM_OwnedQSEv& qsev) {
+    /* The C struct borrows qsev's vector storage — valid for the callback duration */
+    IdsM_QualifiedSecurityEventType c_qsev = qsev.to_c();
+
+    if (sev.config.sink_to_dem && m_dem_cb) {
+        m_stats.sent_to_dem++;
+        m_dem_cb(&c_qsev);
+    }
+    if (sev.config.sink_to_idsr && m_idsr_cb) {
+        m_stats.sent_to_idsr++;
+        m_idsr_cb(&c_qsev);
+    }
+}
+
+IdsM_TimestampDataType IdsM_Manager::makeInternalTimestamp() const {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now);
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now - secs);
+
+    IdsM_TimestampDataType ts{};
+    ts.seconds     = static_cast<uint32_t>(secs.count());
+    ts.nanoseconds = static_cast<uint32_t>(nanos.count()) & 0x3FFFFFFFu; /* 30 bit */
+    ts.source      = IDSM_TIMESTAMP_SOURCE_AUTOSAR;
+    return ts;
+}
+
+STD_RETURN_TYPE IdsM_Manager::Init(const IdsM_ConfigType* config) {
+    if (!config) return E_PARAM_POINTER;
+    if (config->sev_count > 0 && !config->sev_configs) return E_PARAM_POINTER;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    /* Validate configuration */
+    if (config->idsm_instance_id > IDSM_INSTANCE_ID_MAX) return E_PARAM_CONFIG;
+    for (uint16_t i = 0; i < config->sev_count; ++i) {
+        const auto& sc = config->sev_configs[i];
+        if (sc.external_event_id == IDSM_EXTERNAL_EVENT_ID_INVALID) return E_PARAM_CONFIG;
+        if (sc.sensor_instance_id > 63u) return E_PARAM_CONFIG;
+        if (sc.default_reporting_mode > IDSM_REPORTING_DETAILED_BYPASSING_FILTERS) {
+            return E_PARAM_CONFIG;
+        }
+    }
+
+    m_sevs.assign(config->sev_count, IdsM_SevState{});
+    for (uint16_t i = 0; i < config->sev_count; ++i) {
+        m_sevs[i].config         = config->sev_configs[i];
+        m_sevs[i].reporting_mode = config->sev_configs[i].default_reporting_mode;
+        /* First received SEv is forwarded [SWS_IdsM_01032] */
+        m_sevs[i].nth_counter    = config->sev_configs[i].forward_every_nth;
+    }
+    m_idsm_instance_id = config->idsm_instance_id;
+    m_block_state = 0;
     m_stats = Stats{};
-    
+
     /* Start Async Thread */
     m_worker_running.store(true);
     m_worker_thread = std::thread(&IdsM_Manager::worker_loop, this);
-    
+
     return E_OK;
 }
 
@@ -109,129 +195,111 @@ STD_RETURN_TYPE IdsM_Manager::DeInit() {
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_monitors.clear();
-    m_current_mode = IDSM_POST_RUN_MODE;
+    m_sevs.clear();
     m_dem_cb = nullptr;
+    m_idsr_cb = nullptr;
     m_nvm_cb = nullptr;
     m_stats = Stats{};
-    /* Drain any leftover events from the incoming queue */
     while (!m_incoming_queue.empty()) m_incoming_queue.pop();
     return E_OK;
 }
 
-STD_RETURN_TYPE IdsM_Manager::SetOperatingMode(IdsM_OperatingModeType mode) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (mode > IDSM_POST_RUN_MODE) return E_MODE_INVALID;
-    
-    if (m_current_mode != mode) {
-        m_current_mode = mode;
-        m_stats.mode_transitions++;
-        
-        for (auto& [id, mon] : m_monitors) {
-            mon.active = isMonitorEnabledInMode(mon);
-            if (!mon.active) {
-                mon.status = IDSM_STATUS_UNINITIALIZED;
-                while (!mon.event_buffer.empty()) mon.event_buffer.pop();
-            }
-        }
-    }
-    return E_OK;
-}
+/* Non-blocking report: validate, deep-copy, enqueue, wake worker (<1us hot path) */
+void IdsM_Manager::ReportSecurityEvent(IdsM_SecurityEventIdType sev_id,
+                                       const uint8_t* context_data, uint16_t context_size,
+                                       uint16_t context_version, uint16_t count,
+                                       const IdsM_TimestampDataType* timestamp) {
+    if (!m_worker_running.load()) return;
 
-IdsM_OperatingModeType IdsM_Manager::GetOperatingMode() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_current_mode;
-}
-
-/* Non-blocking ReportEvent */
-STD_RETURN_TYPE IdsM_Manager::ReportEvent(const IdsM_EventReportType* event) {
-    if (!event) return E_PARAM_POINTER;
-    if (!m_worker_running.load()) return E_NOT_OK;
-    
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_monitors.find(event->monitor_id);
-        if (it == m_monitors.end() || !it->second.active || !isMonitorEnabledInMode(it->second)) {
-            return E_MODE_INVALID;
+        if (sev_id >= m_sevs.size()) return;   /* DET error IDSM_E_PARAM_INVALID in P2 */
+
+        IdsM_OwnedSEv owned;
+        owned.security_event_id    = sev_id;
+        owned.context_data_version = context_version;
+        owned.count                = (count == 0) ? 1 : count;
+        if (context_data && context_size > 0) {
+            owned.context_data.assign(context_data, context_data + context_size);
         }
-        m_incoming_queue.push(IdsM_OwnedEvent::from(*event));
+        if (timestamp) {
+            owned.has_timestamp = true;
+            owned.timestamp     = *timestamp;
+        }
+
+        m_sevs[sev_id].pending_count++;
+        m_incoming_queue.push(std::move(owned));
+        m_stats.events_reported++;
     }
-    
-    m_queue_cv.notify_one(); // Wake up worker immediately
+
+    m_queue_cv.notify_one();
+}
+
+IdsM_Filters_ReportingModeType IdsM_Manager::GetReportingMode(IdsM_SecurityEventIdType sev_id) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (sev_id >= m_sevs.size()) return IDSM_REPORTING_OFF;
+    return m_sevs[sev_id].reporting_mode;
+}
+
+STD_RETURN_TYPE IdsM_Manager::SetReportingMode(IdsM_SecurityEventIdType sev_id,
+                                               IdsM_Filters_ReportingModeType mode) {
+    if (mode > IDSM_REPORTING_DETAILED_BYPASSING_FILTERS) return E_PARAM_CONFIG;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (sev_id >= m_sevs.size()) return E_PARAM_CONFIG;
+    m_sevs[sev_id].reporting_mode = mode;
     return E_OK;
 }
 
-IdsM_DetectionStatusType IdsM_Manager::GetDetectionStatus(IdsM_MonitorIdType monitor_id) {
+void IdsM_Manager::BswM_StateChanged(IdsM_BlockStateIdType state) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_monitors.find(monitor_id);
-    return (it != m_monitors.end()) ? it->second.status : IDSM_STATUS_UNINITIALIZED;
+    m_block_state = state;
 }
 
-STD_RETURN_TYPE IdsM_Manager::ResetDetectionStatus(IdsM_MonitorIdType monitor_id) {
+IdsM_DetectionStatusType IdsM_Manager::GetDetectionStatus(IdsM_SecurityEventIdType sev_id) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_monitors.find(monitor_id);
-    if (it == m_monitors.end()) return E_PARAM_CONFIG;
-    it->second.status = IDSM_STATUS_OK;
+    if (sev_id >= m_sevs.size()) return IDSM_STATUS_UNINITIALIZED;
+    return m_sevs[sev_id].detection_status;
+}
+
+STD_RETURN_TYPE IdsM_Manager::ResetDetectionStatus(IdsM_SecurityEventIdType sev_id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (sev_id >= m_sevs.size()) return E_PARAM_CONFIG;
+    m_sevs[sev_id].detection_status = IDSM_STATUS_OK;
     return E_OK;
 }
 
-uint32_t IdsM_Manager::GetPendingEventCount(IdsM_MonitorIdType monitor_id) {
+uint32_t IdsM_Manager::GetPendingEventCount(IdsM_SecurityEventIdType sev_id) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_monitors.find(monitor_id);
-    return (it != m_monitors.end()) ? static_cast<uint32_t>(it->second.event_buffer.size()) : 0;
+    if (sev_id >= m_sevs.size()) return 0;
+    return m_sevs[sev_id].pending_count;
 }
 
-STD_RETURN_TYPE IdsM_Manager::FlushEvents(IdsM_MonitorIdType monitor_id) {
+STD_RETURN_TYPE IdsM_Manager::FlushEvents(IdsM_SecurityEventIdType sev_id) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_monitors.find(monitor_id);
-    if (it == m_monitors.end()) return E_PARAM_CONFIG;
-    
-    auto& mon = it->second;
-    while (!mon.event_buffer.empty()) {
-        forwardToDem(mon.event_buffer.front().report);
-        mon.event_buffer.pop();
-    }
+    if (sev_id >= m_sevs.size()) return E_PARAM_CONFIG;
+    /* No per-SEv buffering yet — the worker forwards immediately.
+       Aggregation filter buffers will be drained here in a later iteration. */
     return E_OK;
 }
 
-void IdsM_Manager::SetDemReportCallback(IdsM_DemReportCallback cb) {
+bool IdsM_Manager::IsSecurityEventConfigured(IdsM_SecurityEventIdType sev_id) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return sev_id < m_sevs.size();
+}
+
+void IdsM_Manager::SetDemReportCallback(IdsM_QsevSinkCallbackType cb) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_dem_cb = cb;
+}
+
+void IdsM_Manager::RegisterIdsrSink(IdsM_QsevSinkCallbackType cb) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_idsr_cb = cb;
 }
 
 void IdsM_Manager::SetNvmStoreCallback(IdsM_NvmStoreCallback cb) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_nvm_cb = cb;
-}
-
-bool IdsM_Manager::isMonitorEnabledInMode(const IdsM_InternalMonitor& mon) const {
-    switch (m_current_mode) {
-        case IDSM_PRE_RUN_MODE: return mon.config.enabled_in_pre_run;
-        case IDSM_RUN_MODE: return mon.config.enabled_in_run;
-        case IDSM_POST_RUN_MODE: return mon.config.enabled_in_post_run;
-        default: return false;
-    }
-}
-
-bool IdsM_Manager::isFloodProtected(const IdsM_InternalMonitor& mon, uint64_t now_ns) const {
-    if (mon.config.flood_protection_ms == 0) return false;
-    if (mon.last_report_ns == 0) return false;
-    uint64_t min_interval_ns = static_cast<uint64_t>(mon.config.flood_protection_ms) * 1000000ULL;
-    return (now_ns - mon.last_report_ns) < min_interval_ns;
-}
-
-void IdsM_Manager::forwardToDem(const IdsM_OwnedEvent& event) {
-    m_stats.events_flushed_to_dem++;
-    if (m_dem_cb) {
-        /* Reconstruct C struct; pointer is valid while 'event' is alive */
-        IdsM_EventReportType c_evt = event.to_c();
-        m_dem_cb(&c_evt);
-    }
-}
-
-uint64_t IdsM_Manager::getTimestampNs() const {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 IdsM_Manager::Stats IdsM_Manager::GetStats() const {
@@ -253,8 +321,8 @@ void IdsM_Manager::ResetStats() {
 extern "C" {
 #endif
 
-STD_RETURN_TYPE IdsM_Core_Init(const IdsM_MonitorConfigType* config, uint16_t count) {
-    return IdsM_Manager::Instance().Init(config, count);
+STD_RETURN_TYPE IdsM_Core_Init(const IdsM_ConfigType* config) {
+    return IdsM_Manager::Instance().Init(config);
 }
 
 STD_RETURN_TYPE IdsM_Core_DeInit(void) {
@@ -262,40 +330,56 @@ STD_RETURN_TYPE IdsM_Core_DeInit(void) {
 }
 
 void IdsM_Core_MainFunction(void) {
-    // In async mode, MainFunction is handled by the worker thread.
-    // This is kept for API compatibility but does nothing here.
+    /* In async mode, MainFunction is handled by the worker thread. */
 }
 
-STD_RETURN_TYPE IdsM_Core_SetOperatingMode(IdsM_OperatingModeType mode) {
-    return IdsM_Manager::Instance().SetOperatingMode(mode);
+void IdsM_Core_ReportSecurityEvent(IdsM_SecurityEventIdType sev_id,
+                                   const uint8_t* context_data, uint16_t context_size,
+                                   uint16_t context_version, uint16_t count,
+                                   const IdsM_TimestampDataType* timestamp) {
+    IdsM_Manager::Instance().ReportSecurityEvent(sev_id, context_data, context_size,
+                                                 context_version, count, timestamp);
 }
 
-IdsM_OperatingModeType IdsM_Core_GetOperatingMode(void) {
-    return IdsM_Manager::Instance().GetOperatingMode();
+IdsM_Filters_ReportingModeType IdsM_Core_GetReportingMode(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().GetReportingMode(sev_id);
 }
 
-STD_RETURN_TYPE IdsM_Core_ReportEvent(const IdsM_EventReportType* event) {
-    return IdsM_Manager::Instance().ReportEvent(event);
+STD_RETURN_TYPE IdsM_Core_SetReportingMode(IdsM_SecurityEventIdType sev_id,
+                                           IdsM_Filters_ReportingModeType mode) {
+    return IdsM_Manager::Instance().SetReportingMode(sev_id, mode);
 }
 
-IdsM_DetectionStatusType IdsM_Core_GetDetectionStatus(IdsM_MonitorIdType monitor_id) {
-    return IdsM_Manager::Instance().GetDetectionStatus(monitor_id);
+void IdsM_Core_BswM_StateChanged(IdsM_BlockStateIdType state) {
+    IdsM_Manager::Instance().BswM_StateChanged(state);
 }
 
-STD_RETURN_TYPE IdsM_Core_ResetDetectionStatus(IdsM_MonitorIdType monitor_id) {
-    return IdsM_Manager::Instance().ResetDetectionStatus(monitor_id);
+IdsM_DetectionStatusType IdsM_Core_GetDetectionStatus(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().GetDetectionStatus(sev_id);
 }
 
-uint32_t IdsM_Core_GetPendingEventCount(IdsM_MonitorIdType monitor_id) {
-    return IdsM_Manager::Instance().GetPendingEventCount(monitor_id);
+STD_RETURN_TYPE IdsM_Core_ResetDetectionStatus(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().ResetDetectionStatus(sev_id);
 }
 
-STD_RETURN_TYPE IdsM_Core_FlushEvents(IdsM_MonitorIdType monitor_id) {
-    return IdsM_Manager::Instance().FlushEvents(monitor_id);
+uint32_t IdsM_Core_GetPendingEventCount(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().GetPendingEventCount(sev_id);
 }
 
-void IdsM_Core_SetDemReportCallback(IdsM_DemReportCallback cb) {
+STD_RETURN_TYPE IdsM_Core_FlushEvents(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().FlushEvents(sev_id);
+}
+
+boolean IdsM_Core_IsSecurityEventConfigured(IdsM_SecurityEventIdType sev_id) {
+    return IdsM_Manager::Instance().IsSecurityEventConfigured(sev_id) ? true : false;
+}
+
+void IdsM_Core_SetDemReportCallback(IdsM_QsevSinkCallbackType cb) {
     IdsM_Manager::Instance().SetDemReportCallback(cb);
+}
+
+void IdsM_Core_RegisterIdsrSink(IdsM_QsevSinkCallbackType cb) {
+    IdsM_Manager::Instance().RegisterIdsrSink(cb);
 }
 
 void IdsM_Core_SetNvmStoreCallback(IdsM_NvmStoreCallback cb) {

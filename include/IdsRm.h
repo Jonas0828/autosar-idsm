@@ -5,11 +5,12 @@
 extern "C" {
 #endif
 
-/* Initialize IDSRM, register with IDSM DEM callback slot, and start background worker.
+/* Initialize IDSRM, register as the IDSM IdsR sink (receives QSEvs after
+   qualification), and start background worker.
    Must be called after IdsM_Init(). Calls curl_global_init internally. */
 STD_RETURN_TYPE IdsRm_Init(const IdsRm_ConfigType* config);
 
-/* Stop background worker, flush in-flight events, curl cleanup, unregister DEM callback.
+/* Stop background worker, flush in-flight events, curl cleanup, unregister IdsR sink.
    Calls curl_global_cleanup internally. */
 STD_RETURN_TYPE IdsRm_DeInit(void);
 

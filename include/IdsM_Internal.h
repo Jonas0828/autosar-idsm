@@ -4,7 +4,6 @@
 #ifdef __cplusplus
 
 #include <vector>
-#include <unordered_map>
 #include <queue>
 #include <mutex>
 #include <chrono>
@@ -12,82 +11,93 @@
 #include <atomic>
 #include <condition_variable>
 
-/* Owned copy of an event report — deep-copies the payload bytes.
-   Used everywhere inside the C++ engine so that the caller's
-   buffer can safely go out of scope after IdsM_ReportEvent(). */
-struct IdsM_OwnedEvent {
-    IdsM_MonitorIdType     monitor_id;
-    IdsM_EventIdType       event_id;
-    uint32_t               timestamp_ms;
-    std::vector<uint8_t>   payload;       /* deep-copied from caller */
-    IdsM_EventSeverityType severity;
+/* ── Ingress event (pre-qualification) ──────────────────────────────────────
+   Deep-copies the caller's context data at IdsM_ReportSecurityEvent() time,
+   so the caller's buffer may go out of scope immediately after the call. */
+struct IdsM_OwnedSEv {
+    IdsM_SecurityEventIdType security_event_id;
+    std::vector<uint8_t>     context_data;      /* deep-copied from caller */
+    uint16_t                 context_data_version{1};
+    uint16_t                 count{1};
+    bool                     has_timestamp{false};
+    IdsM_TimestampDataType   timestamp{};
+};
 
-    /* Construct from the public C struct */
-    static IdsM_OwnedEvent from(const IdsM_EventReportType& src) {
-        IdsM_OwnedEvent o;
-        o.monitor_id   = src.monitor_id;
-        o.event_id     = src.event_id;
-        o.timestamp_ms = src.timestamp_ms;
-        o.severity     = src.severity;
-        if (src.payload && src.payload_len > 0)
-            o.payload.assign(src.payload, src.payload + src.payload_len);
-        return o;
-    }
+/* ── Qualified security event (post filter chain) ─────────────────────────── */
+struct IdsM_OwnedQSEv {
+    uint16_t                         idsm_instance_id{0};
+    IdsM_ExternalSecurityEventIdType external_event_id{IDSM_EXTERNAL_EVENT_ID_INVALID};
+    IdsM_SensorInstanceIdType        sensor_instance_id{0};
+    IdsM_EventSeverityType           severity{IDSM_SEVERITY_LOW};
+    uint16_t                         count{1};
+    bool                             has_timestamp{false};
+    IdsM_TimestampDataType           timestamp{};
+    uint16_t                         context_data_version{1};
+    std::vector<uint8_t>             context_data;
 
-    /* Reconstruct a temporary C struct (payload pointer into our vector).
-       The returned struct is only valid while this OwnedEvent is alive. */
-    IdsM_EventReportType to_c() const {
-        IdsM_EventReportType e{};
-        e.monitor_id   = monitor_id;
-        e.event_id     = event_id;
-        e.timestamp_ms = timestamp_ms;
-        e.severity     = severity;
-        e.payload      = payload.empty() ? nullptr : payload.data();
-        e.payload_len  = static_cast<uint16_t>(payload.size());
-        return e;
+    /* Reconstruct a temporary C struct (context pointer into our vector).
+       Valid only while this OwnedQSEv is alive. */
+    IdsM_QualifiedSecurityEventType to_c() const {
+        IdsM_QualifiedSecurityEventType q{};
+        q.idsm_instance_id     = idsm_instance_id;
+        q.external_event_id    = external_event_id;
+        q.sensor_instance_id   = sensor_instance_id;
+        q.severity             = severity;
+        q.count                = count;
+        q.has_timestamp        = has_timestamp ? true : false;
+        q.timestamp            = timestamp;
+        q.context_data_version = context_data_version;
+        q.context_data         = context_data.empty() ? nullptr : context_data.data();
+        q.context_data_size    = static_cast<uint16_t>(context_data.size());
+        return q;
     }
 };
 
-/* Internal event buffer entry */
-struct IdsM_InternalEvent {
-    IdsM_OwnedEvent report;
-    uint64_t first_seen_ns;
-    uint32_t occurrence_count;
-};
-
-/* Internal monitor state */
-struct IdsM_InternalMonitor {
-    IdsM_MonitorConfigType config;
-    IdsM_DetectionStatusType status;
-    std::queue<IdsM_InternalEvent> event_buffer;
-    uint64_t last_report_ns;
-    boolean active;
+/* ── Per-SEv runtime state ────────────────────────────────────────────────── */
+struct IdsM_SevState {
+    IdsM_SecurityEventConfigType    config;
+    IdsM_Filters_ReportingModeType  reporting_mode{IDSM_REPORTING_OFF};
+    IdsM_DetectionStatusType        detection_status{IDSM_STATUS_UNINITIALIZED};
+    uint32_t                        pending_count{0};   /* queued, not yet processed */
+    /* Forward Every Nth runtime counter [SWS_IdsM_01031]. Initialized to n at
+       Init so the first received SEv is forwarded [SWS_IdsM_01032]. */
+    uint16_t                        nth_counter{0};
 };
 
 /* Global manager state (singleton pattern) */
 class IdsM_Manager {
 public:
     static IdsM_Manager& Instance();
-    
+
     /* Public API */
-    STD_RETURN_TYPE Init(const IdsM_MonitorConfigType* config, uint16_t count);
+    STD_RETURN_TYPE Init(const IdsM_ConfigType* config);
     STD_RETURN_TYPE DeInit();
-    STD_RETURN_TYPE SetOperatingMode(IdsM_OperatingModeType mode);
-    IdsM_OperatingModeType GetOperatingMode() const;
-    STD_RETURN_TYPE ReportEvent(const IdsM_EventReportType* event);
-    IdsM_DetectionStatusType GetDetectionStatus(IdsM_MonitorIdType monitor_id);
-    STD_RETURN_TYPE ResetDetectionStatus(IdsM_MonitorIdType monitor_id);
-    uint32_t GetPendingEventCount(IdsM_MonitorIdType monitor_id);
-    STD_RETURN_TYPE FlushEvents(IdsM_MonitorIdType monitor_id);
-    void SetDemReportCallback(IdsM_DemReportCallback cb);
+    void ReportSecurityEvent(IdsM_SecurityEventIdType sev_id,
+                             const uint8_t* context_data, uint16_t context_size,
+                             uint16_t context_version, uint16_t count,
+                             const IdsM_TimestampDataType* timestamp);
+    IdsM_Filters_ReportingModeType GetReportingMode(IdsM_SecurityEventIdType sev_id) const;
+    STD_RETURN_TYPE SetReportingMode(IdsM_SecurityEventIdType sev_id,
+                                     IdsM_Filters_ReportingModeType mode);
+    void BswM_StateChanged(IdsM_BlockStateIdType state);
+    IdsM_DetectionStatusType GetDetectionStatus(IdsM_SecurityEventIdType sev_id);
+    STD_RETURN_TYPE ResetDetectionStatus(IdsM_SecurityEventIdType sev_id);
+    uint32_t GetPendingEventCount(IdsM_SecurityEventIdType sev_id);
+    STD_RETURN_TYPE FlushEvents(IdsM_SecurityEventIdType sev_id);
+    bool IsSecurityEventConfigured(IdsM_SecurityEventIdType sev_id) const;
+    void SetDemReportCallback(IdsM_QsevSinkCallbackType cb);
+    void RegisterIdsrSink(IdsM_QsevSinkCallbackType cb);
     void SetNvmStoreCallback(IdsM_NvmStoreCallback cb);
-    
+
     /* Stats */
     struct Stats {
-        uint32_t total_events_reported;
-        uint32_t events_filtered_flood;
-        uint32_t events_flushed_to_dem;
-        uint32_t mode_transitions;
+        uint32_t events_reported;        /* accepted into the ingress queue */
+        uint32_t dropped_reporting_off;  /* discarded by reporting mode OFF */
+        uint32_t dropped_block_state;    /* discarded by Block State filter */
+        uint32_t dropped_sampling;       /* discarded by Forward Every Nth filter */
+        uint32_t events_qualified;       /* became QSEvs */
+        uint32_t sent_to_dem;
+        uint32_t sent_to_idsr;
     };
     Stats GetStats() const;
     void ResetStats();
@@ -97,27 +107,30 @@ private:
     ~IdsM_Manager() = default;
     IdsM_Manager(const IdsM_Manager&) = delete;
     IdsM_Manager& operator=(const IdsM_Manager&) = delete;
-    
+
     /* --- ASYNC ENGINE --- */
     std::thread m_worker_thread;
     std::atomic<bool> m_worker_running{false};
     std::condition_variable m_queue_cv;
-    std::queue<IdsM_OwnedEvent> m_incoming_queue; // Async event queue (deep-copied)
-    
+    std::queue<IdsM_OwnedSEv> m_incoming_queue;
+
     /* --- STATE --- */
     mutable std::mutex m_mutex;
-    IdsM_OperatingModeType m_current_mode;
-    std::unordered_map<IdsM_MonitorIdType, IdsM_InternalMonitor> m_monitors;
-    IdsM_DemReportCallback m_dem_cb;
-    IdsM_NvmStoreCallback m_nvm_cb;
-    Stats m_stats;
-    
+    std::vector<IdsM_SevState> m_sevs;          /* indexed by internal SEv ID */
+    uint16_t m_idsm_instance_id{0};
+    IdsM_BlockStateIdType m_block_state{0};
+    IdsM_QsevSinkCallbackType m_dem_cb{nullptr};
+    IdsM_QsevSinkCallbackType m_idsr_cb{nullptr};
+    IdsM_NvmStoreCallback m_nvm_cb{nullptr};
+    Stats m_stats{};
+
     /* Helpers */
-    bool isMonitorEnabledInMode(const IdsM_InternalMonitor& mon) const;
-    bool isFloodProtected(const IdsM_InternalMonitor& mon, uint64_t now_ns) const;
-    void forwardToDem(const IdsM_OwnedEvent& event);
-    uint64_t getTimestampNs() const;
-    void worker_loop(); /* Background thread entry point */
+    void worker_loop();                          /* background thread entry */
+    void processEvent(IdsM_OwnedSEv& sev);       /* reporting mode + chain + qualify + dispatch */
+    bool isBlockedByState(const IdsM_SevState& sev) const;   /* Block State filter */
+    bool passForwardEveryNth(IdsM_SevState& sev, uint16_t count); /* Sampling filter */
+    void dispatchQsev(const IdsM_SevState& sev, const IdsM_OwnedQSEv& qsev);
+    IdsM_TimestampDataType makeInternalTimestamp() const;
 };
 
 #endif /* __cplusplus */

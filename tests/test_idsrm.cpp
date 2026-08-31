@@ -38,30 +38,37 @@ static IdsRm_ConfigType make_idsrm_config(const char* url, bool enabled = true,
     return cfg;
 }
 
-static IdsM_MonitorConfigType make_monitor(uint16_t id) {
-    IdsM_MonitorConfigType m{};
-    m.monitor_id          = id;
-    m.event_buffer_size   = 10;
-    m.flood_protection_ms = 0;
-    m.severity_threshold  = IDSM_SEVERITY_LOW;
-    m.enabled_in_pre_run  = false;
-    m.enabled_in_run      = true;
-    m.enabled_in_post_run = false;
-    return m;
-}
-
-/* Persistent payload buffer — must outlive ReportEvent call (deep-copied). */
+/* Persistent payload buffer — deep-copied on report, safe as static. */
 static uint8_t g_test_payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 
-static IdsM_EventReportType make_event(uint16_t mon = 0x001, uint16_t evt = 0x100) {
-    IdsM_EventReportType e{};
-    e.monitor_id   = mon;
-    e.event_id     = evt;
-    e.severity     = IDSM_SEVERITY_HIGH;
-    e.payload      = g_test_payload;
-    e.payload_len  = sizeof(g_test_payload);
-    e.timestamp_ms = 42000;
-    return e;
+/* Single SEv: internal ID 0, external ID 0x8001 (OEM range) */
+static void init_idsm_single_sev() {
+    IdsM_SecurityEventConfigType sev{};
+    sev.external_event_id      = 0x8001;
+    sev.sensor_instance_id     = 0;
+    sev.severity               = IDSM_SEVERITY_HIGH;
+    sev.default_reporting_mode = IDSM_REPORTING_DETAILED;
+    sev.block_state            = nullptr;
+    sev.forward_every_nth      = 0;
+    sev.aggregation_interval_ms = 0;
+    sev.event_threshold        = {0, 0};
+    sev.sink_to_dem            = false;
+    sev.sink_to_idsr           = true;
+
+    IdsM_ConfigType cfg{};
+    cfg.idsm_instance_id        = 1;
+    cfg.main_function_period_ms = 10;
+    cfg.rate_limitation         = {0, 0};
+    cfg.traffic_limitation      = {0, 0};
+    cfg.sev_configs             = &sev;
+    cfg.sev_count               = 1;
+    cfg.event_buffer_size       = 128;
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
+}
+
+static void report_default(uint16_t count = 1) {
+    IdsM_ReportSecurityEvent(0, g_test_payload, sizeof(g_test_payload),
+                             1 /*version*/, count, nullptr);
 }
 
 /* ── In-process mock SOC HTTP server ──────────────────────────────────────── */
@@ -96,7 +103,7 @@ public:
                 int client = accept(m_fd, nullptr, nullptr);
                 if (client < 0) continue;
 
-                char buf[4096]{};
+                char buf[8192]{};
                 recv(client, buf, sizeof(buf) - 1, 0);
 
                 const char* resp =
@@ -177,9 +184,7 @@ protected:
     bool m_idsrm_up = false;
 
     void SetUp() override {
-        auto idsm_cfg = make_monitor(0x001);
-        ASSERT_EQ(E_OK, IdsM_Init(&idsm_cfg, 1));
-        IdsM_SetOperatingMode(IDSM_RUN_MODE);
+        init_idsm_single_sev();
         m_idsm_up = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
@@ -237,8 +242,7 @@ TEST_F(IdsRmTest, SetAuthTokenNullReturnsError) {
 TEST_F(IdsRmTest, DroppedCountWhenDisabled) {
     init_idsrm("http://127.0.0.1:19999/api/idsm-violations", false);
 
-    auto evt = make_event();
-    IdsM_ReportEvent(&evt);
+    report_default();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto stats = IdsRm_GetStats();
@@ -249,8 +253,7 @@ TEST_F(IdsRmTest, DroppedCountWhenDisabled) {
 TEST_F(IdsRmTest, ResetStats) {
     init_idsrm("http://127.0.0.1:19999/api/idsm-violations", false);
 
-    auto evt = make_event();
-    IdsM_ReportEvent(&evt);
+    report_default();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
     IdsRm_ResetStats();
@@ -273,9 +276,7 @@ protected:
 
     void SetUp() override {
         server.start();
-        auto idsm_cfg = make_monitor(0x001);
-        ASSERT_EQ(E_OK, IdsM_Init(&idsm_cfg, 1));
-        IdsM_SetOperatingMode(IDSM_RUN_MODE);
+        init_idsm_single_sev();
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
 
@@ -298,8 +299,7 @@ protected:
 
 TEST_F(IdsRmIntegrationTest, EventPostedToSoc) {
     init_idsrm();
-    auto evt = make_event();
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
+    report_default();
 
     EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
     auto stats = IdsRm_GetStats();
@@ -307,29 +307,48 @@ TEST_F(IdsRmIntegrationTest, EventPostedToSoc) {
     EXPECT_EQ(1u, stats.events_posted);
 }
 
-TEST_F(IdsRmIntegrationTest, JsonPayloadContainsExpectedFields) {
+TEST_F(IdsRmIntegrationTest, JsonPayloadContainsQsevFields) {
     init_idsrm();
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
+    report_default(3);
 
     EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
 
     std::string body = server.last_body();
-    EXPECT_NE(std::string::npos, body.find("\"monitor_id\""));
-    EXPECT_NE(std::string::npos, body.find("\"event_id\""));
-    EXPECT_NE(std::string::npos, body.find("\"timestamp_ms\""));
-    EXPECT_NE(std::string::npos, body.find("\"severity\""));
-    EXPECT_NE(std::string::npos, body.find("\"payload\""));
-    EXPECT_NE(std::string::npos, body.find("\"payload_len\""));
-    EXPECT_NE(std::string::npos, body.find("DEADBEEF"));  /* hex-encoded payload bytes */
-    EXPECT_NE(std::string::npos, body.find("HIGH"));
-    EXPECT_NE(std::string::npos, body.find("42000"));
+    /* Serialized IDS Message present */
+    EXPECT_NE(std::string::npos, body.find("\"ids_message\""));
+    /* Decoded QSEv fields */
+    EXPECT_NE(std::string::npos, body.find("\"protocol_version\":2"));
+    EXPECT_NE(std::string::npos, body.find("\"has_context_data\":true"));
+    EXPECT_NE(std::string::npos, body.find("\"has_timestamp\":true"));
+    EXPECT_NE(std::string::npos, body.find("\"idsm_instance_id\":1"));
+    EXPECT_NE(std::string::npos, body.find("\"sensor_instance_id\":0"));
+    EXPECT_NE(std::string::npos, body.find("\"event_id\":32769"));  /* 0x8001 */
+    EXPECT_NE(std::string::npos, body.find("\"count\":3"));
+    EXPECT_NE(std::string::npos, body.find("\"severity\":\"HIGH\""));
+    EXPECT_NE(std::string::npos, body.find("\"context_data_version\":1"));
+    EXPECT_NE(std::string::npos, body.find("\"payload\":\"DEADBEEF\""));
+    EXPECT_NE(std::string::npos, body.find("\"payload_len\":4"));
+}
+
+TEST_F(IdsRmIntegrationTest, IdsMessageHexMatchesWireFormat) {
+    init_idsrm();
+    report_default();
+
+    EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
+
+    std::string body = server.last_body();
+    /* Event frame (8B) + timestamp (8B) + context frame (2+1+4B):
+       Byte0   0x23 = version 2, context+timestamp bits
+       Byte1-2 0x00 0x40 = idsm instance 1, sensor instance 0
+       Byte3-4 0x80 0x01 = external event ID (big-endian)
+       Byte5-6 0x00 0x01 = count
+       Byte7   0x00 reserved                                          */
+    EXPECT_NE(std::string::npos, body.find("\"ids_message\":\"2300408001000100"));
 }
 
 TEST_F(IdsRmIntegrationTest, DisabledDropsEvents) {
     init_idsrm(false);
-    auto evt = make_event();
-    IdsM_ReportEvent(&evt);
+    report_default();
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     EXPECT_EQ(0, server.count());
@@ -341,14 +360,12 @@ TEST_F(IdsRmIntegrationTest, DisabledDropsEvents) {
 TEST_F(IdsRmIntegrationTest, EnableAfterDisableResumesForwarding) {
     init_idsrm(false);
 
-    auto evt = make_event();
-    IdsM_ReportEvent(&evt);
+    report_default();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     EXPECT_EQ(0, server.count());
 
     IdsRm_Enable();
-    auto evt2 = make_event(0x001, 0x200);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt2));
+    report_default();
 
     EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
     EXPECT_EQ(1, server.count());
@@ -361,14 +378,12 @@ TEST_F(IdsRmIntegrationTest, RuntimeUrlChangeIsRespected) {
     ASSERT_EQ(E_OK, IdsRm_Init(&cfg));
     m_idsrm_up = true;
 
-    auto evt = make_event();
-    IdsM_ReportEvent(&evt);
+    report_default();
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
     EXPECT_EQ(0, server.count());
 
     IdsRm_SetSocUrl(soc_url().c_str());
-    auto evt2 = make_event(0x001, 0x200);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt2));
+    report_default();
 
     EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
     EXPECT_EQ(1, server.count());
@@ -378,12 +393,24 @@ TEST_F(IdsRmIntegrationTest, MultipleEventsAllPosted) {
     init_idsrm();
 
     for (int i = 0; i < 5; ++i) {
-        auto evt = make_event(0x001, static_cast<uint16_t>(0x100 + i));
-        ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
+        report_default();
     }
 
     EXPECT_TRUE(wait_until([&]{ return server.count() >= 5; }, 3000));
     auto stats = IdsRm_GetStats();
     EXPECT_EQ(5u, stats.events_received);
     EXPECT_EQ(5u, stats.events_posted);
+}
+
+TEST_F(IdsRmIntegrationTest, BriefReportingModeStripsContextBeforeSink) {
+    init_idsrm();
+    /* Switch SEv 0 to BRIEF: context data dropped before any sink sees it */
+    ASSERT_EQ(E_OK, IdsM_SetReportingMode(0, IDSM_REPORTING_BRIEF));
+
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return server.count() >= 1; }));
+
+    std::string body = server.last_body();
+    EXPECT_NE(std::string::npos, body.find("\"has_context_data\":false"));
+    EXPECT_NE(std::string::npos, body.find("\"payload_len\":0"));
 }

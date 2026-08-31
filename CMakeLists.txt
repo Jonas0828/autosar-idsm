@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 add_library(idsm_core STATIC
     src/IdsM.c
     src/IdsM_Manager.cpp
+    src/IdsM_Protocol.c
 )
 target_include_directories(idsm_core PUBLIC include)
 target_link_libraries(idsm_core PUBLIC Threads::Threads)

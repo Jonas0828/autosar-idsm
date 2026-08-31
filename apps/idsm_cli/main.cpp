@@ -9,12 +9,43 @@
 #include <cstring>
 #include <vector>
 
+/* SEv symbolic names (simulate configuration-generated code) */
+#define SEV_CAN_IDS        ((IdsM_SecurityEventIdType)0)   /* ext 0x8001 */
+#define SEV_SECOC          ((IdsM_SecurityEventIdType)1)   /* ext 0x8002 */
+#define SEV_ETHERNET       ((IdsM_SecurityEventIdType)2)   /* ext 0x8003 */
+#define SEV_OBD2           ((IdsM_SecurityEventIdType)3)   /* ext 0x8004 */
+#define SEV_FW_INTEGRITY   ((IdsM_SecurityEventIdType)4)   /* ext 0x8005 */
+
+/* Simulated BswM states for the Block State filter demo */
+#define BLOCK_STATE_NORMAL     ((IdsM_BlockStateIdType)0)
+#define BLOCK_STATE_SERVICE    ((IdsM_BlockStateIdType)1)
+
+/* Demo: OBD-II SEv is blocked while the ECU is in SERVICE state.
+   Static storage: the pointer is kept inside the IdsM configuration. */
+static const IdsM_BlockStateFilterConfigType g_obd_block_states = {
+    {BLOCK_STATE_SERVICE}, 1
+};
+
+static const char* reporting_mode_str(IdsM_Filters_ReportingModeType m) {
+    switch (m) {
+        case IDSM_REPORTING_OFF:                        return "OFF";
+        case IDSM_REPORTING_BRIEF:                      return "BRIEF";
+        case IDSM_REPORTING_DETAILED:                   return "DETAILED";
+        case IDSM_REPORTING_BRIEF_BYPASSING_FILTERS:    return "BRIEF_BYPASSING";
+        case IDSM_REPORTING_DETAILED_BYPASSING_FILTERS: return "DETAILED_BYPASSING";
+        default:                                        return "?";
+    }
+}
+
 int main() {
-    std::cout << "=== AUTOSAR IDSM Simulator (Async) ===\n"
-              << "Commands: init, mode <pre|run|post>, report, status, flush,\n"
+    std::cout << "=== AUTOSAR IDSM Simulator (Async, R24-11) ===\n"
+              << "Commands: init, report sev=<id> [pay=<hex>] [count=<n>],\n"
+              << "          rptmode <sev> [off|brief|detailed|bbypass|dbypass],\n"
+              << "          blockstate <id>   (0=NORMAL, 1=SERVICE; blocks OBD-II SEv 3),\n"
+              << "          status <sev>, flush <sev>,\n"
               << "          idsrm <enable|disable|status|url <url>|token <tok>>, quit\n";
 
-    bool initialized      = false;
+    bool initialized       = false;
     bool idsrm_initialized = false;
 
     std::string line;
@@ -26,28 +57,38 @@ int main() {
         if (cmd == "quit") break;
 
         else if (cmd == "init") {
-            // 0x001 CAN Bus IDS | 0x002 SecOC Auth | 0x003 Ethernet IDS
-            // 0x004 OBD-II Scanner | 0x005 ECU Firmware Integrity
-            IdsM_MonitorConfigType configs[5] = {
-                {0x001, 20, 0, IDSM_SEVERITY_LOW, true, true, false},
-                {0x002, 20, 0, IDSM_SEVERITY_LOW, true, true, false},
-                {0x003, 20, 0, IDSM_SEVERITY_LOW, true, true, false},
-                {0x004, 20, 0, IDSM_SEVERITY_LOW, true, true, false},
-                {0x005, 20, 0, IDSM_SEVERITY_LOW, true, true, false},
+            /* 0: CAN-IDS | 1: SecOC Auth | 2: Ethernet IDS | 3: OBD-II | 4: FW Integrity
+               External event IDs in the OEM range (0x8000+) [PRS_Ids_00017] */
+            IdsM_SecurityEventConfigType sevs[5] = {
+                /* extId,  inst, severity,             default reporting mode,   blockState, nth, agg, threshold, dem,  idsr */
+                {0x8001, 0, IDSM_SEVERITY_HIGH,     IDSM_REPORTING_DETAILED, nullptr,            0, 0, {0, 0}, true, true},
+                {0x8002, 0, IDSM_SEVERITY_CRITICAL, IDSM_REPORTING_DETAILED, nullptr,            0, 0, {0, 0}, true, true},
+                {0x8003, 0, IDSM_SEVERITY_MEDIUM,   IDSM_REPORTING_DETAILED, nullptr,            0, 0, {0, 0}, true, true},
+                {0x8004, 0, IDSM_SEVERITY_MEDIUM,   IDSM_REPORTING_DETAILED, &g_obd_block_states, 0, 0, {0, 0}, true, true},
+                {0x8005, 0, IDSM_SEVERITY_CRITICAL, IDSM_REPORTING_DETAILED, nullptr,            0, 0, {0, 0}, true, true},
             };
-            if (IdsM_Init(configs, 5) == E_OK) {
+            IdsM_ConfigType cfg{};
+            cfg.idsm_instance_id        = 1;
+            cfg.main_function_period_ms = 10;
+            cfg.rate_limitation         = {0, 0};   /* disabled (phase 4) */
+            cfg.traffic_limitation      = {0, 0};   /* disabled (phase 4) */
+            cfg.sev_configs             = sevs;
+            cfg.sev_count               = 5;
+            cfg.event_buffer_size       = 128;
+
+            if (IdsM_Init(&cfg) == E_OK) {
                 initialized = true;
                 std::cout << "[IDSM] Initialized | Async Engine Running\n"
-                          << "[IDSM] Monitors: 0x001=CAN-IDS | 0x002=SecOC"
-                          << " | 0x003=Ethernet | 0x004=OBD-II | 0x005=FW-Integrity\n";
+                          << "[IDSM] SEvs: 0=CAN-IDS(0x8001) | 1=SecOC(0x8002)"
+                          << " | 2=Ethernet(0x8003) | 3=OBD-II(0x8004) | 4=FW(0x8005)\n";
             } else {
                 std::cout << "[IDSM ERR] Init failed\n";
                 continue;
             }
 
             /* Initialize IDSRM immediately after IDSM.
-               IDSRM registers itself as the DEM callback — do not call
-               IdsM_SetDemReportCallback separately after this point. */
+               IDSRM registers itself as the IdsR sink — do not call
+               IdsM_RegisterIdsrSink separately after this point. */
             IdsRm_ConfigType idsrm_cfg{};
             std::strncpy(idsrm_cfg.soc_url,
                          "http://localhost:8080/api/idsm-violations",
@@ -66,24 +107,11 @@ int main() {
             }
         }
 
-        else if (cmd == "mode" && initialized) {
-            std::string mode_str; iss >> mode_str;
-            IdsM_OperatingModeType mode;
-            if      (mode_str == "pre")  mode = IDSM_PRE_RUN_MODE;
-            else if (mode_str == "run")  mode = IDSM_RUN_MODE;
-            else if (mode_str == "post") mode = IDSM_POST_RUN_MODE;
-            else { std::cout << "[ERR] Usage: mode <pre|run|post>\n"; continue; }
-
-            if (IdsM_SetOperatingMode(mode) == E_OK) {
-                std::cout << "[IDSM] Mode set to " << mode_str << "\n";
-            } else {
-                std::cout << "[IDSM ERR] Mode change failed\n";
-            }
-        }
-
         else if (cmd == "report" && initialized) {
-            IdsM_EventReportType evt{};
-            /* Local buffer for parsed payload bytes — valid until ReportEvent copies */
+            /* report sev=<id> [pay=<hex>] [count=<n>]
+               e.g. report sev=0 pay=00000123080102030405060708 count=1 */
+            long sev_id = -1;
+            unsigned count = 1;
             std::vector<uint8_t> pay_buf;
             std::string param;
             while (iss >> param) {
@@ -91,44 +119,89 @@ int main() {
                 if (eq == std::string::npos) continue;
                 std::string k = param.substr(0, eq);
                 std::string v = param.substr(eq + 1);
-                if      (k == "mon") evt.monitor_id = static_cast<uint16_t>(std::stoul(v, nullptr, 16));
-                else if (k == "evt") evt.event_id   = static_cast<uint16_t>(std::stoul(v, nullptr, 16));
-                else if (k == "sev") evt.severity   = static_cast<IdsM_EventSeverityType>(std::stoul(v));
+                if      (k == "sev" || k == "mon") sev_id = std::stol(v, nullptr, 0);
+                else if (k == "count")             count  = std::stoul(v, nullptr, 0);
                 else if (k == "pay") {
-                    /* Parse hex byte string: pay=DEADBEEF → {0xDE,0xAD,0xBE,0xEF} */
+                    /* Parse hex byte string: pay=DEADBEEF -> {0xDE,0xAD,0xBE,0xEF} */
                     pay_buf.clear();
                     for (size_t j = 0; j + 1 < v.size(); j += 2) {
                         pay_buf.push_back(static_cast<uint8_t>(std::stoul(v.substr(j, 2), nullptr, 16)));
                     }
                 }
             }
-            evt.payload     = pay_buf.empty() ? nullptr : pay_buf.data();
-            evt.payload_len = static_cast<uint16_t>(pay_buf.size());
-            evt.timestamp_ms = static_cast<uint32_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count() % 100000);
+            if (sev_id < 0 || !IdsM_IsSecurityEventConfigured(
+                    static_cast<IdsM_SecurityEventIdType>(sev_id))) {
+                std::cout << "[IDSM ERR] Unknown SEv id (see init list)\n";
+                continue;
+            }
+            /* Deep-copied on enqueue; pay_buf may go out of scope right after */
+            IdsM_ReportSecurityEvent(static_cast<IdsM_SecurityEventIdType>(sev_id),
+                                     pay_buf.empty() ? nullptr : pay_buf.data(),
+                                     static_cast<uint16_t>(pay_buf.size()),
+                                     1 /* contextDataVersion */,
+                                     static_cast<uint16_t>(count),
+                                     nullptr /* timestamp: internal */);
+            std::cout << "[IDSM] Event Queued | SEv=" << sev_id << "\n";
+        }
 
-            if (IdsM_ReportEvent(&evt) == E_OK) {
-                std::cout << "[IDSM] Event Queued | Monitor=0x"
-                          << std::hex << evt.monitor_id << std::dec << "\n";
+        else if (cmd == "rptmode" && initialized) {
+            /* rptmode <sev>            -> query
+               rptmode <sev> <mode>    -> set (off|brief|detailed|bbypass|dbypass) */
+            std::string sev_str, mode_str;
+            iss >> sev_str;
+            if (sev_str.empty()) { std::cout << "[ERR] Usage: rptmode <sev> [mode]\n"; continue; }
+            auto sev_id = static_cast<IdsM_SecurityEventIdType>(std::stoul(sev_str, nullptr, 0));
+            if (!IdsM_IsSecurityEventConfigured(sev_id)) {
+                std::cout << "[ERR] Unknown SEv id\n"; continue;
+            }
+            iss >> mode_str;
+            if (mode_str.empty()) {
+                std::cout << "[IDSM] SEv " << sev_id << " reporting mode = "
+                          << reporting_mode_str(IdsM_GetReportingMode(sev_id)) << "\n";
+                continue;
+            }
+            IdsM_Filters_ReportingModeType mode;
+            if      (mode_str == "off")      mode = IDSM_REPORTING_OFF;
+            else if (mode_str == "brief")    mode = IDSM_REPORTING_BRIEF;
+            else if (mode_str == "detailed") mode = IDSM_REPORTING_DETAILED;
+            else if (mode_str == "bbypass")  mode = IDSM_REPORTING_BRIEF_BYPASSING_FILTERS;
+            else if (mode_str == "dbypass")  mode = IDSM_REPORTING_DETAILED_BYPASSING_FILTERS;
+            else { std::cout << "[ERR] mode: off|brief|detailed|bbypass|dbypass\n"; continue; }
+
+            if (IdsM_SetReportingMode(sev_id, mode) == E_OK) {
+                std::cout << "[IDSM] SEv " << sev_id << " reporting mode -> "
+                          << reporting_mode_str(mode) << "\n";
             } else {
-                std::cout << "[IDSM ERR] Queue failed (check config/mode)\n";
+                std::cout << "[IDSM ERR] SetReportingMode failed\n";
             }
         }
 
+        else if (cmd == "blockstate" && initialized) {
+            /* blockstate <id> — simulate BswM notifying the current block state */
+            std::string state_str; iss >> state_str;
+            if (state_str.empty()) {
+                std::cout << "[ERR] Usage: blockstate <id>  (0=NORMAL, 1=SERVICE)\n";
+                continue;
+            }
+            auto state = static_cast<IdsM_BlockStateIdType>(std::stoul(state_str, nullptr, 0));
+            IdsM_BswM_StateChanged(state);
+            std::cout << "[IDSM] Block state -> " << static_cast<unsigned>(state)
+                      << (state == BLOCK_STATE_SERVICE ? " (OBD-II SEv blocked)" : "") << "\n";
+        }
+
         else if (cmd == "status" && initialized) {
-            uint16_t mon_id; iss >> std::hex >> mon_id;
-            auto st = IdsM_GetDetectionStatus(mon_id);
+            uint16_t sev_id; iss >> std::hex >> sev_id;
+            auto st = IdsM_GetDetectionStatus(sev_id);
             const char* st_str = st == IDSM_STATUS_OK        ? "OK"        :
                                   st == IDSM_STATUS_VIOLATION ? "VIOLATION" : "UNINIT";
-            std::cout << "[IDSM] Monitor 0x" << std::hex << mon_id
+            std::cout << "[IDSM] SEv 0x" << std::hex << sev_id
                       << std::dec << " Status=" << st_str << "\n";
         }
 
         else if (cmd == "flush" && initialized) {
-            uint16_t mon_id; iss >> std::hex >> mon_id;
-            if (IdsM_FlushEvents(mon_id) == E_OK) {
-                std::cout << "[IDSM] Events flushed to DEM\n";
+            uint16_t sev_id; iss >> std::hex >> sev_id;
+            if (IdsM_FlushEvents(sev_id) == E_OK) {
+                std::cout << "[IDSM] Events flushed to sinks\n";
             }
         }
 

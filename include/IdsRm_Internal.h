@@ -4,7 +4,7 @@
 
 #ifdef __cplusplus
 
-#include "IdsM_Internal.h"  /* for IdsM_OwnedEvent */
+#include "IdsM_Internal.h"  /* for IdsM_OwnedQSEv */
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -38,9 +38,10 @@ public:
     IdsRm_StatsType GetStats() const;
     void            ResetStats();
 
-    /* DEM callback target — must be non-blocking (<1µs).
-       Called by IdsM worker thread while IdsM holds its own mutex. */
-    void OnDemEvent(const IdsM_EventReportType* event);
+    /* IdsR sink callback target — must be non-blocking (<1us).
+       Called by the IdsM worker thread while IdsM holds its own mutex.
+       Deep-copies the QSEv (context data included) into the local queue. */
+    void OnQsev(const IdsM_QualifiedSecurityEventType* qsev);
 
 private:
     IdsRm_Manager()  = default;
@@ -53,7 +54,7 @@ private:
     std::atomic<bool>        m_worker_running{false};
     std::mutex               m_queue_mutex;   /* held only for enqueue/dequeue */
     std::condition_variable  m_queue_cv;
-    std::queue<IdsM_OwnedEvent> m_event_queue;
+    std::queue<IdsM_OwnedQSEv> m_event_queue;
 
     /* Module state */
     std::atomic<bool> m_initialized{false};
@@ -77,9 +78,9 @@ private:
     void worker_loop();
 
     /* HTTP */
-    bool postWithRetry(const IdsM_OwnedEvent& event);
-    bool postEvent(const IdsM_OwnedEvent& event);
-    void buildJsonPayload(const IdsM_OwnedEvent& event, std::string& out) const;
+    bool postWithRetry(const IdsM_OwnedQSEv& qsev);
+    bool postQsev(const IdsM_OwnedQSEv& qsev);
+    void buildJsonPayload(const IdsM_OwnedQSEv& qsev, std::string& out) const;
     const char* severityToString(IdsM_EventSeverityType sev) const;
 
     /* curl lifecycle (called from worker thread only) */

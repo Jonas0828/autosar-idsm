@@ -19,8 +19,8 @@ STD_RETURN_TYPE IdsRm_Core_SetAuthToken(const char* token);
 IdsRm_StatsType IdsRm_Core_GetStats(void);
 void            IdsRm_Core_ResetStats(void);
 
-/* Static C-compatible shim registered with IdsM_SetDemReportCallback */
-void IdsRm_Core_DemCallbackShim(const IdsM_EventReportType* event);
+/* Static C-compatible shim registered with IdsM_RegisterIdsrSink */
+void IdsRm_Core_IdsrSinkShim(const IdsM_QualifiedSecurityEventType* qsev);
 
 #ifdef __cplusplus
 }

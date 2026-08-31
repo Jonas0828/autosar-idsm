@@ -8,9 +8,14 @@ Usage:
 Listens on:
     POST http://localhost:<port>/api/idsm-violations
 
-Expected JSON payload:
-    {"monitor_id": <uint>, "event_id": <uint>, "timestamp_ms": <uint>,
-     "severity": "LOW|MEDIUM|HIGH|CRITICAL", "payload": "<hex>", "payload_len": <uint>}
+Expected JSON payload (QSEv forwarded by IDSRM, R24-11 data model):
+    {"ids_message": "<hex>", "protocol_version": 2,
+     "has_context_data": <bool>, "has_timestamp": <bool>,
+     "idsm_instance_id": <uint>, "sensor_instance_id": <uint>,
+     "event_id": <uint>, "count": <uint>, "severity": "LOW|MEDIUM|HIGH|CRITICAL",
+     "timestamp_s": <uint>, "timestamp_ns": <uint>,
+     "context_data_version": <uint>,
+     "payload": "<hex>", "payload_len": <uint>}
 
 Returns:
     200 {"status":"ok"}   on valid event
@@ -38,21 +43,24 @@ class SocHandler(BaseHTTPRequestHandler):
 
         try:
             event = json.loads(body)
-            assert "monitor_id"   in event, "missing monitor_id"
-            assert "event_id"     in event, "missing event_id"
-            assert "timestamp_ms" in event, "missing timestamp_ms"
-            assert "severity"     in event, "missing severity"
-            assert "payload"      in event, "missing payload"
+            assert "ids_message"          in event, "missing ids_message"
+            assert "event_id"             in event, "missing event_id"
+            assert "count"                in event, "missing count"
+            assert "severity"             in event, "missing severity"
+            assert "payload"              in event, "missing payload"
+            assert "context_data_version" in event, "missing context_data_version"
             assert event["severity"] in VALID_SEVERITIES, \
                 f"invalid severity: {event['severity']}"
 
             print(
-                f"[SOC] monitor=0x{event['monitor_id']:04X}"
-                f"  event=0x{event['event_id']:04X}"
+                f"[SOC] event=0x{event['event_id']:04X}"
+                f"  idsm={event.get('idsm_instance_id', '?')}"
+                f"  sensor={event.get('sensor_instance_id', '?')}"
+                f"  count={event['count']}"
                 f"  severity={event['severity']:<8}"
                 f"  payload={event['payload']}"
                 f"  len={event.get('payload_len', '?')}"
-                f"  ts={event['timestamp_ms']}ms",
+                f"  msg={event['ids_message']}",
                 flush=True
             )
 

@@ -3,7 +3,9 @@
 #include <thread>
 #include <chrono>
 #include <functional>
+#include <cstring>
 #include "IdsM.h"
+#include "IdsM_Protocol.h"
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -18,48 +20,58 @@ static bool wait_until(std::function<bool()> cond, int max_ms = 1000) {
     return cond(); /* final check */
 }
 
-static IdsM_MonitorConfigType make_monitor(
-    uint16_t id,
-    uint32_t buf   = 10,
-    uint32_t flood = 0,
-    bool pre = false, bool run = true, bool post = false)
+static IdsM_SecurityEventConfigType make_sev(
+    IdsM_ExternalSecurityEventIdType ext_id = 0x8001,
+    IdsM_Filters_ReportingModeType mode = IDSM_REPORTING_DETAILED,
+    IdsM_EventSeverityType severity = IDSM_SEVERITY_HIGH)
 {
-    IdsM_MonitorConfigType m{};
-    m.monitor_id          = id;
-    m.event_buffer_size   = buf;
-    m.flood_protection_ms = flood;
-    m.severity_threshold  = IDSM_SEVERITY_LOW;
-    m.enabled_in_pre_run  = pre;
-    m.enabled_in_run      = run;
-    m.enabled_in_post_run = post;
-    return m;
+    IdsM_SecurityEventConfigType s{};
+    s.external_event_id      = ext_id;
+    s.sensor_instance_id     = 0;
+    s.severity               = severity;
+    s.default_reporting_mode = mode;
+    s.block_state            = nullptr;
+    s.forward_every_nth      = 0;
+    s.aggregation_interval_ms = 0;
+    s.event_threshold        = {0, 0};
+    s.sink_to_dem            = true;
+    s.sink_to_idsr           = true;
+    return s;
 }
 
-/* Persistent payload buffer for test events — must outlive ReportEvent call.
-   ReportEvent deep-copies, so this is safe as a static. */
-static uint8_t g_test_payload[1] = {0xAB};
-
-static IdsM_EventReportType make_event(uint16_t mon, uint16_t evt,
-                                        IdsM_EventSeverityType sev = IDSM_SEVERITY_HIGH) {
-    IdsM_EventReportType e{};
-    e.monitor_id   = mon;
-    e.event_id     = evt;
-    e.severity     = sev;
-    g_test_payload[0] = 0xAB;
-    e.payload      = g_test_payload;
-    e.payload_len  = 1;
-    e.timestamp_ms = 1000;
-    return e;
+static IdsM_ConfigType make_config(const IdsM_SecurityEventConfigType* sevs, uint16_t n) {
+    IdsM_ConfigType c{};
+    c.idsm_instance_id        = 1;
+    c.main_function_period_ms = 10;
+    c.rate_limitation         = {0, 0};
+    c.traffic_limitation      = {0, 0};
+    c.sev_configs             = sevs;
+    c.sev_count               = n;
+    c.event_buffer_size       = 128;
+    return c;
 }
 
-/* ── Shared callback state ────────────────────────────────────────────────── */
+/* Persistent payload buffer — ReportSecurityEvent deep-copies, safe as static. */
+static uint8_t g_test_payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+
+/* ── Shared sink capture state ────────────────────────────────────────────── */
 
 static std::atomic<int>      g_dem_count{0};
-static std::atomic<uint16_t> g_last_monitor{0};
+static std::atomic<uint16_t> g_last_ext_id{0};
+static std::atomic<uint16_t> g_last_count{0};
+static std::atomic<uint16_t> g_last_ctx_version{0};
+static std::atomic<size_t>   g_last_ctx_size{0};
+static IdsM_EventSeverityType g_last_severity = IDSM_SEVERITY_LOW;
+static bool                  g_last_has_ts = false;
 
-static void dem_cb(const IdsM_EventReportType* e) {
+static void dem_cb(const IdsM_QualifiedSecurityEventType* q) {
     g_dem_count++;
-    g_last_monitor.store(e->monitor_id);
+    g_last_ext_id.store(q->external_event_id);
+    g_last_count.store(q->count);
+    g_last_ctx_version.store(q->context_data_version);
+    g_last_ctx_size.store(q->context_data_size);
+    g_last_severity  = q->severity;
+    g_last_has_ts    = q->has_timestamp;
 }
 
 /* ── Fixture ──────────────────────────────────────────────────────────────── */
@@ -68,21 +80,37 @@ class IdsMTest : public ::testing::Test {
 protected:
     void SetUp() override {
         g_dem_count.store(0);
-        g_last_monitor.store(0);
+        g_last_ext_id.store(0);
+        g_last_count.store(0);
+        g_last_ctx_version.store(0);
+        g_last_ctx_size.store(0);
     }
 
     void TearDown() override {
         IdsM_DeInit();
     }
 
-    void init_default(uint16_t mon_id = 0x001, uint32_t buf = 10,
-                      uint32_t flood = 0) {
-        auto cfg = make_monitor(mon_id, buf, flood);
-        ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
+    void init_default(IdsM_Filters_ReportingModeType mode = IDSM_REPORTING_DETAILED) {
+        auto sev = make_sev(0x8001, mode);
+        init_with_sev(sev);
+    }
+
+    void init_with_sev(const IdsM_SecurityEventConfigType& sev) {
+        auto cfg = make_config(&sev, 1);
+        ASSERT_EQ(E_OK, IdsM_Init(&cfg));
         IdsM_SetDemReportCallback(dem_cb);
-        IdsM_SetOperatingMode(IDSM_RUN_MODE);
         /* Give the worker thread a moment to start and enter wait */
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+
+    void report_default(uint16_t count = 1) {
+        IdsM_ReportSecurityEvent(0, g_test_payload, sizeof(g_test_payload),
+                                 1 /*version*/, count, nullptr);
+    }
+
+    /* Report n events (count=1 each) */
+    void report_n(int n) {
+        for (int i = 0; i < n; ++i) report_default();
     }
 };
 
@@ -91,204 +119,536 @@ protected:
    ═══════════════════════════════════════════════════════════════════════════ */
 
 TEST_F(IdsMTest, InitDeInit) {
-    auto cfg = make_monitor(0x001);
-    EXPECT_EQ(E_OK, IdsM_Init(&cfg, 1));
+    auto sev = make_sev();
+    auto cfg = make_config(&sev, 1);
+    EXPECT_EQ(E_OK, IdsM_Init(&cfg));
     EXPECT_EQ(E_OK, IdsM_DeInit());
 }
 
-TEST_F(IdsMTest, InitNullConfigZeroCount) {
-    EXPECT_EQ(E_OK, IdsM_Init(nullptr, 0));
+TEST_F(IdsMTest, InitNullConfig) {
+    EXPECT_EQ(E_PARAM_POINTER, IdsM_Init(nullptr));
 }
 
-TEST_F(IdsMTest, InitNullConfigNonZeroCount) {
-    EXPECT_EQ(E_PARAM_POINTER, IdsM_Init(nullptr, 1));
+TEST_F(IdsMTest, InitNullSevArrayNonZeroCount) {
+    IdsM_ConfigType cfg = make_config(nullptr, 3);
+    EXPECT_EQ(E_PARAM_POINTER, IdsM_Init(&cfg));
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   Operating Mode
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-TEST_F(IdsMTest, DefaultModeIsPreRun) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(IDSM_PRE_RUN_MODE, IdsM_GetOperatingMode());
+TEST_F(IdsMTest, InitRejectsInvalidExternalEventId) {
+    auto sev = make_sev(IDSM_EXTERNAL_EVENT_ID_INVALID);
+    auto cfg = make_config(&sev, 1);
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_Init(&cfg));
 }
 
-TEST_F(IdsMTest, SetAndGetMode) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(E_OK, IdsM_SetOperatingMode(IDSM_RUN_MODE));
-    EXPECT_EQ(IDSM_RUN_MODE, IdsM_GetOperatingMode());
-    EXPECT_EQ(E_OK, IdsM_SetOperatingMode(IDSM_POST_RUN_MODE));
-    EXPECT_EQ(IDSM_POST_RUN_MODE, IdsM_GetOperatingMode());
+TEST_F(IdsMTest, InitRejectsSensorInstanceIdAbove63) {
+    auto sev = make_sev();
+    sev.sensor_instance_id = 64;
+    auto cfg = make_config(&sev, 1);
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_Init(&cfg));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   ReportEvent guards
+   Reporting Mode Filter (CP §7.6.1.1)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-TEST_F(IdsMTest, ReportNullEvent) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(E_PARAM_POINTER, IdsM_ReportEvent(nullptr));
+TEST_F(IdsMTest, ReportingModeOffDiscardsEvent) {
+    init_default(IDSM_REPORTING_OFF);
+    report_default();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(0, g_dem_count.load());
+    /* Dropped before acceptance — detection status untouched */
+    EXPECT_EQ(IDSM_STATUS_UNINITIALIZED, IdsM_GetDetectionStatus(0));
 }
 
-TEST_F(IdsMTest, ReportUnknownMonitor) {
-    init_default();
-    auto evt = make_event(0x999, 0x001);
-    EXPECT_EQ(E_MODE_INVALID, IdsM_ReportEvent(&evt));
+TEST_F(IdsMTest, ReportingModeBriefDropsContextData) {
+    init_default(IDSM_REPORTING_BRIEF);
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(0u, g_last_ctx_size.load());   /* context stripped */
 }
 
-TEST_F(IdsMTest, ReportInWrongMode) {
-    auto cfg = make_monitor(0x001, 10, 0, false, true, false);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    /* Default mode is PRE_RUN; monitor only enabled in RUN */
-    auto evt = make_event(0x001, 0x001);
-    EXPECT_EQ(E_MODE_INVALID, IdsM_ReportEvent(&evt));
+TEST_F(IdsMTest, ReportingModeDetailedKeepsContextData) {
+    init_default(IDSM_REPORTING_DETAILED);
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(sizeof(g_test_payload), g_last_ctx_size.load());
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   DEM callback
-   ═══════════════════════════════════════════════════════════════════════════ */
+TEST_F(IdsMTest, ReportingModeBriefBypassingQualifiesImmediately) {
+    init_default(IDSM_REPORTING_BRIEF_BYPASSING_FILTERS);
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(0u, g_last_ctx_size.load());
+}
 
-TEST_F(IdsMTest, DemCallbackFires) {
-    init_default();
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
+TEST_F(IdsMTest, ReportingModeDetailedBypassingKeepsContext) {
+    init_default(IDSM_REPORTING_DETAILED_BYPASSING_FILTERS);
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(sizeof(g_test_payload), g_last_ctx_size.load());
+}
 
+TEST_F(IdsMTest, SetReportingModeAtRuntime) {
+    init_default(IDSM_REPORTING_DETAILED);
+    EXPECT_EQ(IDSM_REPORTING_DETAILED, IdsM_GetReportingMode(0));
+
+    ASSERT_EQ(E_OK, IdsM_SetReportingMode(0, IDSM_REPORTING_OFF));
+    EXPECT_EQ(IDSM_REPORTING_OFF, IdsM_GetReportingMode(0));
+
+    report_default();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(0, g_dem_count.load());
+
+    ASSERT_EQ(E_OK, IdsM_SetReportingMode(0, IDSM_REPORTING_DETAILED));
+    report_default();
     EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
-    EXPECT_EQ(1, g_dem_count.load());
-    EXPECT_EQ(0x001, g_last_monitor.load());
 }
 
-TEST_F(IdsMTest, DemCallbackNotFiredWhenNoCallback) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    IdsM_SetOperatingMode(IDSM_RUN_MODE);
+TEST_F(IdsMTest, SetReportingModeRejectsInvalidSevAndMode) {
+    init_default();
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_SetReportingMode(0x99, IDSM_REPORTING_DETAILED));
+    EXPECT_EQ(E_PARAM_CONFIG,
+              IdsM_SetReportingMode(0, static_cast<IdsM_Filters_ReportingModeType>(99)));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Block State Filter (CP §7.6.1.2)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, BlockStateDropsEventsInBlockedState) {
+    static const IdsM_BlockStateFilterConfigType block_cfg = {{5}, 1};
+    auto sev = make_sev(0x8001);
+    sev.block_state = &block_cfg;
+    init_with_sev(sev);
+
+    /* Current state 0 (not blocked) -> flows */
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+
+    /* Enter blocked state 5 -> dropped */
+    IdsM_BswM_StateChanged(5);
+    report_default();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, g_dem_count.load());
+
+    /* Back to a non-blocked state -> flows again */
+    IdsM_BswM_StateChanged(0);
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 2; }));
+}
+
+TEST_F(IdsMTest, BlockStateNullConfigAlwaysPasses) {
+    init_default();   /* block_state = nullptr */
+    IdsM_BswM_StateChanged(7);
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+}
+
+TEST_F(IdsMTest, BlockStateSkippedInBypassingMode) {
+    static const IdsM_BlockStateFilterConfigType block_cfg = {{5}, 1};
+    auto sev = make_sev(0x8001, IDSM_REPORTING_DETAILED_BYPASSING_FILTERS);
+    sev.block_state = &block_cfg;
+    init_with_sev(sev);
+
+    IdsM_BswM_StateChanged(5);   /* blocked, but BYPASSING mode skips the chain */
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Forward Every Nth Filter (CP §7.6.2.1)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, ForwardNthPassesFirstAndEveryThird) {
+    /* n=3 -> forwards SEvs 1, 4, 7 [SWS_IdsM_01031 example] */
+    auto sev = make_sev(0x8001);
+    sev.forward_every_nth = 3;
+    init_with_sev(sev);
+
+    report_n(7);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(3, g_dem_count.load());
+}
+
+TEST_F(IdsMTest, ForwardNthResetsCounterAfterForwarding) {
+    /* n=2 -> forwards 1, 3, 5: counter restarts after each pass */
+    auto sev = make_sev(0x8001);
+    sev.forward_every_nth = 2;
+    init_with_sev(sev);
+
+    report_n(5);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(3, g_dem_count.load());
+}
+
+TEST_F(IdsMTest, ForwardNthAccumulatesSensorCount) {
+    /* [SWS_IdsM_01034]: count>1 accumulates in the counter, may exceed n.
+       n=3; events with count=2: e1 (counter 3+2>=3 -> fwd), e2 (2 < 3 -> drop),
+       e3 (2+2>=3 -> fwd) */
+    auto sev = make_sev(0x8001);
+    sev.forward_every_nth = 3;
+    init_with_sev(sev);
+
+    report_default(2);
+    report_default(2);
+    report_default(2);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 2; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(2, g_dem_count.load());
+    /* Forwarded SEv keeps its original count unmodified [SWS_IdsM_01033] */
+    EXPECT_EQ(2, g_last_count.load());
+}
+
+TEST_F(IdsMTest, ForwardNthDisabledWhenZero) {
+    auto sev = make_sev(0x8001);
+    sev.forward_every_nth = 0;
+    init_with_sev(sev);
+
+    report_n(4);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 4; }, 2000));
+}
+
+TEST_F(IdsMTest, ForwardNthIsPerSevIndependent) {
+    /* Two SEvs with different n: counters independent */
+    IdsM_SecurityEventConfigType sevs[2] = {
+        make_sev(0x8001), make_sev(0x8002)
+    };
+    sevs[0].forward_every_nth = 3;   /* 1 of 3 passes */
+    sevs[1].forward_every_nth = 0;   /* all pass */
+    auto cfg = make_config(sevs, 2);
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
+    IdsM_SetDemReportCallback(dem_cb);
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
 
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
+    for (int i = 0; i < 6; ++i) IdsM_ReportSecurityEvent(0, nullptr, 0, 1, 1, nullptr);
+    for (int i = 0; i < 6; ++i) IdsM_ReportSecurityEvent(1, nullptr, 0, 1, 1, nullptr);
+
+    /* sev0: 2 pass (1st, 4th); sev1: 6 pass -> total 8 */
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 8; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(8, g_dem_count.load());
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   QSEv structure (CP §7.8.1)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, QsevFieldsPopulatedFromConfig) {
+    init_default();
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(0x8001, g_last_ext_id.load());
+    EXPECT_EQ(1, g_last_count.load());                    /* count initialized to 1 */
+    EXPECT_EQ(IDSM_SEVERITY_HIGH, g_last_severity);       /* from SEv config */
+    EXPECT_TRUE(g_last_has_ts);                           /* internal timestamp added */
+    EXPECT_EQ(1, g_last_ctx_version.load());
+}
+
+TEST_F(IdsMTest, QsevCountReflectsSensorPreAggregation) {
+    init_default();
+    report_default(7 /* count */);
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(7, g_last_count.load());
+}
+
+TEST_F(IdsMTest, SensorProvidedTimestampIsForwarded) {
+    /* Capture via a local sink that inspects the timestamp */
+    static std::atomic<uint32_t> captured_sec{0};
+    static std::atomic<int>      captured_src{-1};
+    auto sev = make_sev();
+    auto cfg = make_config(&sev, 1);
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
+    IdsM_SetDemReportCallback([](const IdsM_QualifiedSecurityEventType* q) {
+        captured_sec.store(q->timestamp.seconds);
+        captured_src.store(static_cast<int>(q->timestamp.source));
+        g_dem_count++;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+    IdsM_TimestampDataType ts{};
+    ts.seconds     = 123456;
+    ts.nanoseconds = 789000000;
+    ts.source      = IDSM_TIMESTAMP_SOURCE_OEM;
+    IdsM_ReportSecurityEvent(0, nullptr, 0, 1, 1, &ts);
+
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(123456u, captured_sec.load());
+    EXPECT_EQ(static_cast<int>(IDSM_TIMESTAMP_SOURCE_OEM), captured_src.load());
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   No operating mode gating (方案 A regression)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, EventsFlowImmediatelyAfterInitWithoutAnyModeSetup) {
+    /* 方案 A: there is no operating mode. A DETAILED SEv must qualify events
+       right after IdsM_Init without any mode-related call. */
+    init_default(IDSM_REPORTING_DETAILED);
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+}
+
+TEST_F(IdsMTest, BlockStateNotificationDoesNotGateEventsYet) {
+    /* IdsM_BswM_StateChanged stores the state; the Block State filter itself
+       arrives in phase 2. Events must still flow. */
+    init_default();
+    IdsM_BswM_StateChanged(3);
+    report_default();
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Report guards & compatibility wrapper
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, ReportToUnknownSevIsSilentlyDropped) {
+    init_default();
+    /* void API (spec-conformant); invalid ID -> dropped (DET error in P2) */
+    IdsM_ReportSecurityEvent(0x99, g_test_payload, sizeof(g_test_payload), 1, 1, nullptr);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     EXPECT_EQ(0, g_dem_count.load());
 }
 
-TEST_F(IdsMTest, MultipleEventsAllForwarded) {
-    init_default(0x001, 20, 0);
+TEST_F(IdsMTest, CompatReportEventForwardsViaNewApi) {
+    init_default();
+    IdsM_EventReportType old{};
+    old.monitor_id   = 0;   /* interpreted as internal SEv ID */
+    old.event_id     = 0x100;
+    old.severity     = IDSM_SEVERITY_HIGH;
+    old.payload      = g_test_payload;
+    old.payload_len  = sizeof(g_test_payload);
+    old.timestamp_ms = 1000;
 
-    for (int i = 0; i < 5; ++i) {
-        auto evt = make_event(0x001, static_cast<uint16_t>(0x100 + i));
-        ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
-    }
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 5; }, 2000));
-    EXPECT_EQ(5, g_dem_count.load());
+    EXPECT_EQ(E_OK, IdsM_ReportEvent(&old));
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(0x8001, g_last_ext_id.load());
+    EXPECT_EQ(1, g_last_count.load());   /* count=1 fixed by wrapper */
+}
+
+TEST_F(IdsMTest, CompatReportEventRejectsNullAndUnknown) {
+    init_default();
+    EXPECT_EQ(E_PARAM_POINTER, IdsM_ReportEvent(nullptr));
+
+    IdsM_EventReportType old{};
+    old.monitor_id = 0x99;
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_ReportEvent(&old));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Detection Status
    ═══════════════════════════════════════════════════════════════════════════ */
 
-TEST_F(IdsMTest, StatusUninitializedForUnknownMonitor) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(IDSM_STATUS_UNINITIALIZED, IdsM_GetDetectionStatus(0x999));
+TEST_F(IdsMTest, StatusUninitializedForUnknownSev) {
+    init_default();
+    EXPECT_EQ(IDSM_STATUS_UNINITIALIZED, IdsM_GetDetectionStatus(0x99));
 }
 
 TEST_F(IdsMTest, StatusBecomesViolationAfterEvent) {
     init_default();
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
-    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0x001));
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0));
 }
 
 TEST_F(IdsMTest, ResetDetectionStatus) {
     init_default();
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
-    EXPECT_EQ(E_OK, IdsM_ResetDetectionStatus(0x001));
-    EXPECT_EQ(IDSM_STATUS_OK, IdsM_GetDetectionStatus(0x001));
+    report_default();
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(E_OK, IdsM_ResetDetectionStatus(0));
+    EXPECT_EQ(IDSM_STATUS_OK, IdsM_GetDetectionStatus(0));
 }
 
-TEST_F(IdsMTest, ResetUnknownMonitorReturnsError) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(E_PARAM_CONFIG, IdsM_ResetDetectionStatus(0x999));
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   Mode transitions
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-TEST_F(IdsMTest, ModeTransitionClearsBuffer) {
+TEST_F(IdsMTest, ResetUnknownSevReturnsError) {
     init_default();
-    auto evt = make_event(0x001, 0x100);
-    ASSERT_EQ(E_OK, IdsM_ReportEvent(&evt));
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
-    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0x001));
-
-    IdsM_SetOperatingMode(IDSM_POST_RUN_MODE);
-    EXPECT_EQ(IDSM_STATUS_UNINITIALIZED, IdsM_GetDetectionStatus(0x001));
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_ResetDetectionStatus(0x99));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Flood protection
+   Multiple SEvs & sinks
    ═══════════════════════════════════════════════════════════════════════════ */
 
-TEST_F(IdsMTest, FloodProtectionLimitsForwarding) {
-    /* 10-second flood window — only one event should pass */
-    init_default(0x001, 10, 10000);
-
-    for (int i = 0; i < 5; ++i) {
-        auto evt = make_event(0x001, static_cast<uint16_t>(0x100 + i));
-        IdsM_ReportEvent(&evt);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    EXPECT_EQ(1, g_dem_count.load());
-}
-
-TEST_F(IdsMTest, FloodProtectionDisabledWhenZero) {
-    init_default(0x001, 20, 0);
-
-    for (int i = 0; i < 3; ++i) {
-        auto evt = make_event(0x001, static_cast<uint16_t>(0x100 + i));
-        IdsM_ReportEvent(&evt);
-    }
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
-    EXPECT_EQ(3, g_dem_count.load());
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   Multiple monitors
-   ═══════════════════════════════════════════════════════════════════════════ */
-
-TEST_F(IdsMTest, MultipleMonitorsIndependent) {
-    IdsM_MonitorConfigType cfgs[2] = {
-        make_monitor(0x001, 10, 0, false, true, false),
-        make_monitor(0x002, 10, 0, false, true, false)
+TEST_F(IdsMTest, MultipleSevsIndependent) {
+    IdsM_SecurityEventConfigType sevs[2] = {
+        make_sev(0x8001, IDSM_REPORTING_DETAILED),
+        make_sev(0x8002, IDSM_REPORTING_OFF)
     };
-    ASSERT_EQ(E_OK, IdsM_Init(cfgs, 2));
+    auto cfg = make_config(sevs, 2);
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
     IdsM_SetDemReportCallback(dem_cb);
-    IdsM_SetOperatingMode(IDSM_RUN_MODE);
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
 
-    auto e1 = make_event(0x001, 0x100);
-    auto e2 = make_event(0x002, 0x200);
-    IdsM_ReportEvent(&e1);
-    IdsM_ReportEvent(&e2);
+    IdsM_ReportSecurityEvent(0, nullptr, 0, 1, 1, nullptr);
+    IdsM_ReportSecurityEvent(1, nullptr, 0, 1, 1, nullptr);   /* OFF -> dropped */
 
-    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 2; }, 2000));
-    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0x001));
-    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0x002));
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(1, g_dem_count.load());
+    EXPECT_EQ(IDSM_STATUS_VIOLATION, IdsM_GetDetectionStatus(0));
+    EXPECT_EQ(IDSM_STATUS_UNINITIALIZED, IdsM_GetDetectionStatus(1));
+}
+
+TEST_F(IdsMTest, IdsrSinkReceivesQsevWhenConfigured) {
+    static std::atomic<int> idsr_count{0};
+    idsr_count.store(0);
+
+    auto sev = make_sev(0x8001, IDSM_REPORTING_DETAILED);
+    sev.sink_to_dem  = false;
+    sev.sink_to_idsr = true;
+    auto cfg = make_config(&sev, 1);
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
+    IdsM_RegisterIdsrSink([](const IdsM_QualifiedSecurityEventType*) { idsr_count++; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+    IdsM_ReportSecurityEvent(0, nullptr, 0, 1, 1, nullptr);
+    EXPECT_TRUE(wait_until([&]{ return idsr_count.load() >= 1; }));
+    EXPECT_EQ(0, g_dem_count.load());   /* dem sink disabled for this SEv */
+}
+
+TEST_F(IdsMTest, PendingCountTracksQueue) {
+    init_default();
+    report_default();
+    /* Either still pending or already processed — counter must end at 0 */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    EXPECT_EQ(0u, IdsM_GetPendingEventCount(0));
+    EXPECT_EQ(0u, IdsM_GetPendingEventCount(0x99)); /* unknown -> 0 */
+}
+
+TEST_F(IdsMTest, FlushUnknownSevReturnsError) {
+    init_default();
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_FlushEvents(0x99));
+    EXPECT_EQ(E_OK, IdsM_FlushEvents(0));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Flush
+   IDS Protocol serializer (PRS §5.1) — pure unit tests, no manager
    ═══════════════════════════════════════════════════════════════════════════ */
 
-TEST_F(IdsMTest, FlushUnknownMonitorReturnsError) {
-    auto cfg = make_monitor(0x001);
-    ASSERT_EQ(E_OK, IdsM_Init(&cfg, 1));
-    EXPECT_EQ(E_PARAM_CONFIG, IdsM_FlushEvents(0x999));
+class IdsMProtocolTest : public ::testing::Test {
+protected:
+    IdsM_QualifiedSecurityEventType q{};
+
+    void SetUp() override {
+        q.idsm_instance_id     = 1;
+        q.external_event_id    = 0x8001;
+        q.sensor_instance_id   = 2;
+        q.severity             = IDSM_SEVERITY_HIGH;
+        q.count                = 3;
+        q.has_timestamp        = false;
+        q.context_data_version = 1;
+        q.context_data         = nullptr;
+        q.context_data_size    = 0;
+    }
+};
+
+TEST_F(IdsMProtocolTest, EventFrameLayout) {
+    uint8_t buf[8]{};
+    ASSERT_EQ(8u, IdsM_Protocol_GetMessageSize(&q));
+    ASSERT_EQ(8u, IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+
+    /* Byte0: version 2 in high nibble, no optional fields */
+    EXPECT_EQ(0x20, buf[0]);
+    /* Byte1-2: IdsM instance 1 (10 bit) | sensor instance 2 (6 bit)
+       idsm=1 -> 0b0000000001, sensor=2 -> 0b000010
+       Byte1 = idsm>>2 = 0; Byte2 = (idsm&3)<<6 | sensor = 0x40 | 0x02 */
+    EXPECT_EQ(0x00, buf[1]);
+    EXPECT_EQ(0x42, buf[2]);
+    /* Byte3-4: external event ID big-endian */
+    EXPECT_EQ(0x80, buf[3]);
+    EXPECT_EQ(0x01, buf[4]);
+    /* Byte5-6: count big-endian */
+    EXPECT_EQ(0x00, buf[5]);
+    EXPECT_EQ(0x03, buf[6]);
+    /* Byte7: reserved */
+    EXPECT_EQ(0x00, buf[7]);
+}
+
+TEST_F(IdsMProtocolTest, TimestampEncoding) {
+    q.has_timestamp        = true;
+    q.timestamp.seconds     = 0x01020304;
+    q.timestamp.nanoseconds = 500000000;   /* 0x1DCD6500, fits 30 bit */
+    q.timestamp.source      = IDSM_TIMESTAMP_SOURCE_AUTOSAR;
+
+    uint8_t buf[16]{};
+    ASSERT_EQ(16u, IdsM_Protocol_GetMessageSize(&q));
+    ASSERT_EQ(16u, IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+
+    EXPECT_EQ(0x22, buf[0]);               /* header bit1 = timestamp */
+    /* Byte8: source=0 (AUTOSAR) | ns bits 29..24 = 0x1DCD6500>>24 & 0x3F = 0x1D */
+    EXPECT_EQ(0x1D, buf[8]);
+    EXPECT_EQ(0xCD, buf[9]);
+    EXPECT_EQ(0x65, buf[10]);
+    EXPECT_EQ(0x00, buf[11]);
+    /* seconds big-endian */
+    EXPECT_EQ(0x01, buf[12]);
+    EXPECT_EQ(0x02, buf[13]);
+    EXPECT_EQ(0x03, buf[14]);
+    EXPECT_EQ(0x04, buf[15]);
+}
+
+TEST_F(IdsMProtocolTest, TimestampOemSourceSetsBit7) {
+    q.has_timestamp    = true;
+    q.timestamp.source = IDSM_TIMESTAMP_SOURCE_OEM;
+    uint8_t buf[16]{};
+    ASSERT_EQ(16u, IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+    EXPECT_EQ(0x80, buf[8] & 0x80);
+}
+
+TEST_F(IdsMProtocolTest, ContextDataShortFormLength) {
+    static const uint8_t ctx[13] = {0,0,1,0x23,8,1,2,3,4,5,6,7,8};
+    q.context_data      = ctx;
+    q.context_data_size = sizeof(ctx);
+    q.context_data_version = 0x0102;
+
+    uint8_t buf[8 + 2 + 1 + 13]{};
+    ASSERT_EQ(sizeof(buf), IdsM_Protocol_GetMessageSize(&q));
+    ASSERT_EQ(sizeof(buf), IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+
+    EXPECT_EQ(0x21, buf[0]);               /* header bit0 = context data */
+    EXPECT_EQ(0x01, buf[8]);               /* version high byte */
+    EXPECT_EQ(0x02, buf[9]);               /* version low byte */
+    EXPECT_EQ(13, buf[10]);                /* 7-bit short length */
+    EXPECT_EQ(0, std::memcmp(&buf[11], ctx, sizeof(ctx)));
+}
+
+TEST_F(IdsMProtocolTest, ContextDataLongFormLength) {
+    static uint8_t ctx[200];
+    for (int i = 0; i < 200; ++i) ctx[i] = static_cast<uint8_t>(i);
+    q.context_data      = ctx;
+    q.context_data_size = sizeof(ctx);
+
+    uint8_t buf[8 + 2 + 4 + 200]{};
+    ASSERT_EQ(sizeof(buf), IdsM_Protocol_GetMessageSize(&q));
+    ASSERT_EQ(sizeof(buf), IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+
+    /* 31-bit long form: byte0 = 0x80 | (len>>24), then 3 bytes */
+    EXPECT_EQ(0x80, buf[10]);
+    EXPECT_EQ(0x00, buf[11]);
+    EXPECT_EQ(0x00, buf[12]);
+    EXPECT_EQ(0xC8, buf[13]);              /* 200 */
+    EXPECT_EQ(0, std::memcmp(&buf[14], ctx, sizeof(ctx)));
+}
+
+TEST_F(IdsMProtocolTest, RejectsNullAndSmallBuffer) {
+    uint8_t buf[8]{};
+    EXPECT_EQ(0u, IdsM_Protocol_SerializeQSEv(nullptr, buf, sizeof(buf)));
+    EXPECT_EQ(0u, IdsM_Protocol_SerializeQSEv(&q, nullptr, sizeof(buf)));
+    EXPECT_EQ(0u, IdsM_Protocol_SerializeQSEv(&q, buf, 7));   /* too small */
+    EXPECT_EQ(0u, IdsM_Protocol_GetMessageSize(nullptr));
+}
+
+TEST_F(IdsMProtocolTest, FullMessageRoundTripFieldCheck) {
+    /* All optional fields: event frame + timestamp + context */
+    static const uint8_t ctx[2] = {0xAA, 0xBB};
+    q.has_timestamp        = true;
+    q.timestamp.seconds     = 42;
+    q.timestamp.nanoseconds = 1000;
+    q.context_data          = ctx;
+    q.context_data_size     = sizeof(ctx);
+    q.context_data_version  = 5;
+
+    uint8_t buf[8 + 8 + 2 + 1 + 2]{};
+    ASSERT_EQ(sizeof(buf), IdsM_Protocol_SerializeQSEv(&q, buf, sizeof(buf)));
+    EXPECT_EQ(0x23, buf[0]);   /* version 2 + context + timestamp bits */
 }

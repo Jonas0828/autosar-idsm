@@ -1,5 +1,6 @@
 #include "IdsRm_Internal.h"
 #include "IdsM.h"
+#include "IdsM_Protocol.h"
 #include <curl/curl.h>
 #include <cstring>
 #include <cstdio>
@@ -8,7 +9,7 @@
 #include <mutex>
 
 /* Forward declaration — defined in the C-bridge section at the bottom */
-extern "C" void IdsRm_Core_DemCallbackShim(const IdsM_EventReportType* event);
+extern "C" void IdsRm_Core_IdsrSinkShim(const IdsM_QualifiedSecurityEventType* qsev);
 
 /* curl_global_init must be called exactly once per process and is not
    thread-safe. Use call_once so repeated Init/DeInit cycles in tests
@@ -53,8 +54,8 @@ STD_RETURN_TYPE IdsRm_Manager::Init(const IdsRm_ConfigType* config) {
 
     curl_global_init_once();
 
-    /* Register C shim as the DEM callback with IDSM */
-    IdsM_SetDemReportCallback(IdsRm_Core_DemCallbackShim);
+    /* Register as the IdsR sink: receives QSEvs after qualification */
+    IdsM_RegisterIdsrSink(IdsRm_Core_IdsrSinkShim);
 
     m_worker_running.store(true);
     m_worker_thread = std::thread(&IdsRm_Manager::worker_loop, this);
@@ -67,7 +68,7 @@ STD_RETURN_TYPE IdsRm_Manager::DeInit() {
     if (!m_initialized.load()) return E_IDSRM_NOT_INIT;
 
     /* Unregister first so no new events arrive after we start shutdown */
-    IdsM_SetDemReportCallback(nullptr);
+    IdsM_RegisterIdsrSink(nullptr);
 
     m_worker_running.store(false);
     m_queue_cv.notify_all();
@@ -127,9 +128,9 @@ void IdsRm_Manager::ResetStats() {
     m_stats = IdsRm_StatsType{};
 }
 
-/* ───────────────────────── DEM callback ─────────────────────────────────── */
+/* ───────────────────────── IdsR sink callback ───────────────────────────── */
 
-void IdsRm_Manager::OnDemEvent(const IdsM_EventReportType* event) {
+void IdsRm_Manager::OnQsev(const IdsM_QualifiedSecurityEventType* qsev) {
     /* Fast exit — relaxed load avoids a full memory barrier on the hot path */
     if (!m_enabled.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> slock(m_stats_mutex);
@@ -144,7 +145,21 @@ void IdsRm_Manager::OnDemEvent(const IdsM_EventReportType* event) {
             m_stats.events_dropped++;
             return;
         }
-        m_event_queue.push(IdsM_OwnedEvent::from(*event));
+        /* Deep-copy: the C struct's context_data pointer dangles after return */
+        IdsM_OwnedQSEv owned;
+        owned.idsm_instance_id     = qsev->idsm_instance_id;
+        owned.external_event_id    = qsev->external_event_id;
+        owned.sensor_instance_id   = qsev->sensor_instance_id;
+        owned.severity             = qsev->severity;
+        owned.count                = qsev->count;
+        owned.has_timestamp        = qsev->has_timestamp;
+        owned.timestamp            = qsev->timestamp;
+        owned.context_data_version = qsev->context_data_version;
+        if (qsev->context_data && qsev->context_data_size > 0) {
+            owned.context_data.assign(qsev->context_data,
+                                      qsev->context_data + qsev->context_data_size);
+        }
+        m_event_queue.push(std::move(owned));
     }
 
     {
@@ -161,7 +176,7 @@ void IdsRm_Manager::worker_loop() {
     initCurl();
 
     while (m_worker_running.load()) {
-        std::vector<IdsM_OwnedEvent> batch;
+        std::vector<IdsM_OwnedQSEv> batch;
 
         {
             std::unique_lock<std::mutex> lock(m_queue_mutex);
@@ -178,13 +193,13 @@ void IdsRm_Manager::worker_loop() {
             }
         }
 
-        for (const auto& event : batch) {
-            postWithRetry(event);
+        for (const auto& qsev : batch) {
+            postWithRetry(qsev);
         }
     }
 
     /* Best-effort drain of any events that arrived during shutdown */
-    std::vector<IdsM_OwnedEvent> remaining;
+    std::vector<IdsM_OwnedQSEv> remaining;
     {
         std::lock_guard<std::mutex> lock(m_queue_mutex);
         while (!m_event_queue.empty()) {
@@ -192,8 +207,8 @@ void IdsRm_Manager::worker_loop() {
             m_event_queue.pop();
         }
     }
-    for (const auto& event : remaining) {
-        postWithRetry(event);
+    for (const auto& qsev : remaining) {
+        postWithRetry(qsev);
     }
 
     cleanupCurl();
@@ -201,7 +216,7 @@ void IdsRm_Manager::worker_loop() {
 
 /* ───────────────────────── HTTP POST with retry ─────────────────────────── */
 
-bool IdsRm_Manager::postWithRetry(const IdsM_OwnedEvent& event) {
+bool IdsRm_Manager::postWithRetry(const IdsM_OwnedQSEv& qsev) {
     uint8_t max_retries;
     {
         std::lock_guard<std::mutex> lock(m_config_mutex);
@@ -209,7 +224,7 @@ bool IdsRm_Manager::postWithRetry(const IdsM_OwnedEvent& event) {
     }
 
     for (uint8_t attempt = 0; attempt <= max_retries; ++attempt) {
-        if (postEvent(event)) {
+        if (postQsev(qsev)) {
             std::lock_guard<std::mutex> slock(m_stats_mutex);
             m_stats.events_posted++;
             return true;
@@ -238,7 +253,7 @@ static size_t discard_response(char*, size_t size, size_t nmemb, void*) {
     return size * nmemb;
 }
 
-bool IdsRm_Manager::postEvent(const IdsM_OwnedEvent& event) {
+bool IdsRm_Manager::postQsev(const IdsM_OwnedQSEv& qsev) {
     if (!m_curl_handle) return false;
 
     std::string url, token;
@@ -251,7 +266,7 @@ bool IdsRm_Manager::postEvent(const IdsM_OwnedEvent& event) {
     }
 
     std::string json_body;
-    buildJsonPayload(event, json_body);
+    buildJsonPayload(qsev, json_body);
 
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -285,32 +300,58 @@ bool IdsRm_Manager::postEvent(const IdsM_OwnedEvent& event) {
 
 /* ───────────────────────── JSON builder ─────────────────────────────────── */
 
-void IdsRm_Manager::buildJsonPayload(const IdsM_OwnedEvent& event,
-                                      std::string& out) const {
-    /* Build hex string from payload bytes */
-    std::string payload_hex;
-    payload_hex.reserve(event.payload.size() * 2);
-    for (uint8_t byte : event.payload) {
-        char hex[3];
-        std::snprintf(hex, sizeof(hex), "%02X", byte);
-        payload_hex += hex;
+void IdsRm_Manager::buildJsonPayload(const IdsM_OwnedQSEv& qsev,
+                                     std::string& out) const {
+    /* Serialize to the IDS Message wire format (PRS §5.1) */
+    IdsM_QualifiedSecurityEventType c_qsev = qsev.to_c();
+    std::vector<uint8_t> msg(IdsM_Protocol_GetMessageSize(&c_qsev));
+    uint16_t msg_len = 0;
+    if (!msg.empty()) {
+        msg_len = IdsM_Protocol_SerializeQSEv(&c_qsev, msg.data(),
+                                              static_cast<uint16_t>(msg.size()));
     }
 
-    /* Use std::string instead of fixed buffer — payload can be any size */
-    char header[256];
+    auto to_hex = [](const uint8_t* data, size_t len) {
+        std::string hex;
+        hex.reserve(len * 2);
+        for (size_t i = 0; i < len; ++i) {
+            char b[3];
+            std::snprintf(b, sizeof(b), "%02X", data[i]);
+            hex += b;
+        }
+        return hex;
+    };
+
+    const std::string msg_hex     = to_hex(msg.data(), msg_len);
+    const std::string payload_hex = to_hex(qsev.context_data.data(),
+                                           qsev.context_data.size());
+
+    /* Header block: decoded fields + serialized wire format */
+    char header[512];
     std::snprintf(header, sizeof(header),
-        "{\"monitor_id\":%u,\"event_id\":%u,"
-        "\"timestamp_ms\":%u,\"severity\":\"%s\","
-        "\"payload\":\"",
-        static_cast<unsigned>(event.monitor_id),
-        static_cast<unsigned>(event.event_id),
-        static_cast<unsigned>(event.timestamp_ms),
-        severityToString(event.severity));
+        "{\"ids_message\":\"%s\",\"protocol_version\":%u,"
+        "\"has_context_data\":%s,\"has_timestamp\":%s,"
+        "\"idsm_instance_id\":%u,\"sensor_instance_id\":%u,"
+        "\"event_id\":%u,\"count\":%u,\"severity\":\"%s\","
+        "\"timestamp_s\":%u,\"timestamp_ns\":%u,"
+        "\"context_data_version\":%u,\"payload\":\"",
+        msg_hex.c_str(),
+        IDSM_PROTOCOL_VERSION,
+        qsev.context_data.empty() ? "false" : "true",
+        qsev.has_timestamp ? "true" : "false",
+        static_cast<unsigned>(qsev.idsm_instance_id),
+        static_cast<unsigned>(qsev.sensor_instance_id),
+        static_cast<unsigned>(qsev.external_event_id),
+        static_cast<unsigned>(qsev.count),
+        severityToString(qsev.severity),
+        static_cast<unsigned>(qsev.timestamp.seconds),
+        static_cast<unsigned>(qsev.timestamp.nanoseconds),
+        static_cast<unsigned>(qsev.context_data_version));
 
     char trailer[64];
     std::snprintf(trailer, sizeof(trailer),
         "\",\"payload_len\":%u}",
-        static_cast<unsigned>(event.payload.size()));
+        static_cast<unsigned>(qsev.context_data.size()));
 
     out.clear();
     out.reserve(std::strlen(header) + payload_hex.size() + std::strlen(trailer));
@@ -354,8 +395,8 @@ void IdsRm_Manager::cleanupCurl() {
 extern "C" {
 #endif
 
-void IdsRm_Core_DemCallbackShim(const IdsM_EventReportType* event) {
-    IdsRm_Manager::Instance().OnDemEvent(event);
+void IdsRm_Core_IdsrSinkShim(const IdsM_QualifiedSecurityEventType* qsev) {
+    IdsRm_Manager::Instance().OnQsev(qsev);
 }
 
 STD_RETURN_TYPE IdsRm_Core_Init(const IdsRm_ConfigType* config) {
