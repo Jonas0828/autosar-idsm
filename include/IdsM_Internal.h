@@ -5,6 +5,7 @@
 
 #include <vector>
 #include <queue>
+#include <memory>
 #include <mutex>
 #include <chrono>
 #include <thread>
@@ -62,6 +63,15 @@ struct IdsM_SevState {
     /* Forward Every Nth runtime counter [SWS_IdsM_01031]. Initialized to n at
        Init so the first received SEv is forwarded [SWS_IdsM_01032]. */
     uint16_t                        nth_counter{0};
+    /* Event Aggregation runtime [SWS_IdsM_01041-01044] (C++ side owns the
+       pending event; null when no window is open). */
+    std::unique_ptr<IdsM_OwnedQSEv> agg_pending;        /* staged aggregate   */
+    bool                            agg_has_context{false}; /* first event's ctx kept */
+    uint32_t                        agg_window_start_ms{0};
+    /* Event Threshold runtime [SWS_IdsM_01061-01065] */
+    uint32_t                        thr_accumulated{0};
+    uint32_t                        thr_window_start_ms{0};
+    bool                            thr_window_open{false};
 };
 
 /* Global manager state (singleton pattern) */
@@ -95,6 +105,7 @@ public:
         uint32_t dropped_reporting_off;  /* discarded by reporting mode OFF */
         uint32_t dropped_block_state;    /* discarded by Block State filter */
         uint32_t dropped_sampling;       /* discarded by Forward Every Nth filter */
+        uint32_t dropped_threshold;      /* discarded by Event Threshold filter */
         uint32_t events_qualified;       /* became QSEvs */
         uint32_t sent_to_dem;
         uint32_t sent_to_idsr;
@@ -118,6 +129,7 @@ private:
     mutable std::mutex m_mutex;
     std::vector<IdsM_SevState> m_sevs;          /* indexed by internal SEv ID */
     uint16_t m_idsm_instance_id{0};
+    uint32_t m_main_function_period_ms{10};
     IdsM_BlockStateIdType m_block_state{0};
     IdsM_QsevSinkCallbackType m_dem_cb{nullptr};
     IdsM_QsevSinkCallbackType m_idsr_cb{nullptr};
@@ -127,8 +139,18 @@ private:
     /* Helpers */
     void worker_loop();                          /* background thread entry */
     void processEvent(IdsM_OwnedSEv& sev);       /* reporting mode + chain + qualify + dispatch */
+    uint32_t nowMs() const;                      /* steady clock, ms since epoch */
+    /* Time-window bookkeeping for Aggregation/Threshold; returns the next
+       absolute deadline (ms) or 0 when nothing is pending. */
+    uint32_t expireWindows(uint32_t now_ms);     /* flush due aggregation windows,
+                                                    reset due threshold windows */
     bool isBlockedByState(const IdsM_SevState& sev) const;   /* Block State filter */
     bool passForwardEveryNth(IdsM_SevState& sev, uint16_t count); /* Sampling filter */
+    /* Event Aggregation filter [SWS_IdsM_01041-01046]: stage into the open
+       window or pass through. Returns false when the SEv was absorbed. */
+    bool passAggregation(IdsM_SevState& sev, IdsM_OwnedQSEv& qsev);
+    /* Event Threshold filter [SWS_IdsM_01061-01065]. */
+    bool passThreshold(IdsM_SevState& sev, uint16_t count, uint32_t now_ms);
     void dispatchQsev(const IdsM_SevState& sev, const IdsM_OwnedQSEv& qsev);
     IdsM_TimestampDataType makeInternalTimestamp() const;
 };

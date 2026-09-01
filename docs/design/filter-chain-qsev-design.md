@@ -534,6 +534,7 @@ QSEv / 序列化字节":
 |---|---|---|
 | 1 ✅ (2026-08-25) | 数据模型(§2.1–2.3)+ 新 API + Reporting Mode + QSEv + **PRS 序列化器** + IdsRm sink 化;删除操作模式(方案 A) | 56/56 测试通过 + CLI 端到端冒烟通过 |
 | 2 ✅ (2026-08-25) | BlockState(`IdsM_BswM_StateChanged`)+ ForwardNth | 对应测试组通过 |
+| 3 ✅ (2026-09-01) | Aggregation + Threshold(工作线程 tick 改造:`wait_for` 至最早窗口到期;窗口为 period 整数倍 Init 校验;`IdsM_FlushEvents` 释放暂存聚合) | 对应测试组通过(全量 ctest) |
 | 3 | Aggregation + Threshold(工作线程 tick 改造) | 对应测试组通过 |
 | 4 | Rate/Traffic Limitation + 内部 SEv 机制落地第一个事件 | 对应测试组通过 |
 | 5 | 兼容层删除、CLI/README/CLAUDE.md 更新 | 全量 ctest 通过 |

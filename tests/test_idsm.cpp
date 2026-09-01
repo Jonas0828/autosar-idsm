@@ -332,6 +332,247 @@ TEST_F(IdsMTest, ForwardNthIsPerSevIndependent) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   Event Aggregation Filter (CP §7.6.3.1)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, AggregationMergesWindowIntoSingleQsev) {
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 200;   /* multiple of period 10 */
+    init_with_sev(sev);
+
+    report_n(3);   /* three SEvs within the window */
+    /* None qualified while the window is open */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(0, g_dem_count.load());
+
+    /* After the window expires: one aggregate with the accumulated count */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, g_dem_count.load());
+    EXPECT_EQ(3, g_last_count.load());                    /* merged count */
+    EXPECT_EQ(sizeof(g_test_payload), g_last_ctx_size.load()); /* first ctx kept */
+}
+
+TEST_F(IdsMTest, AggregationKeepsFirstContextOnly) {
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 150;
+    init_with_sev(sev);
+
+    report_default();                    /* first: carries g_test_payload */
+    report_default();                    /* second: same payload anyway */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+    EXPECT_EQ(sizeof(g_test_payload), g_last_ctx_size.load());
+}
+
+TEST_F(IdsMTest, AggregationAddsSensorCount) {
+    /* count pre-aggregation adds up: 2 + 3 = 5 [PRS_Ids_00018] */
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 150;
+    init_with_sev(sev);
+
+    report_default(2);
+    report_default(3);
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+    EXPECT_EQ(5, g_last_count.load());
+}
+
+TEST_F(IdsMTest, AggregationAcrossWindowsDoesNotMerge) {
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 100;
+    init_with_sev(sev);
+
+    report_n(2);                                  /* window 1 */
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); /* expire */
+    report_n(2);                                  /* window 2 */
+
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 2; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(2, g_dem_count.load());             /* two separate aggregates */
+    EXPECT_EQ(2, g_last_count.load());            /* each carries its own 2 */
+}
+
+TEST_F(IdsMTest, AggregationDisabledWhenZero) {
+    init_default();   /* aggregation_interval_ms = 0 */
+    report_n(3);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
+}
+
+TEST_F(IdsMTest, AggregationIsPerSevIndependent) {
+    IdsM_SecurityEventConfigType sevs[2] = {
+        make_sev(0x8001), make_sev(0x8002)
+    };
+    sevs[0].aggregation_interval_ms = 150;   /* aggregates */
+    sevs[1].aggregation_interval_ms = 0;     /* passes through */
+    auto cfg = make_config(sevs, 2);
+    ASSERT_EQ(E_OK, IdsM_Init(&cfg));
+    IdsM_SetDemReportCallback(dem_cb);
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+    for (int i = 0; i < 2; ++i) IdsM_ReportSecurityEvent(0, nullptr, 0, 1, 1, nullptr);
+    for (int i = 0; i < 2; ++i) IdsM_ReportSecurityEvent(1, nullptr, 0, 1, 1, nullptr);
+
+    /* sev0: staged (0 so far); sev1: 2 passed */
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    EXPECT_EQ(2, g_dem_count.load());
+
+    /* sev0's window expires -> 1 aggregate */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(3, g_dem_count.load());
+}
+
+TEST_F(IdsMTest, FlushReleasesPendingAggregation) {
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 5000;   /* far in the future */
+    init_with_sev(sev);
+
+    report_n(2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(0, g_dem_count.load());
+
+    EXPECT_EQ(E_OK, IdsM_FlushEvents(0));
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(1, g_dem_count.load());
+    EXPECT_EQ(2, g_last_count.load());    /* aggregate with merged count */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Event Threshold Filter (CP §7.6.3.2)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, ThresholdDropsUntilAccumulatedThenPasses) {
+    /* threshold=3: first two SEvs (count=1) dropped, third onwards passes */
+    auto sev = make_sev(0x8001);
+    sev.event_threshold = {3, 500};
+    init_with_sev(sev);
+
+    report_n(2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(0, g_dem_count.load());     /* below threshold -> dropped */
+
+    report_n(2);                          /* accumulated reaches 3 -> passes */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(2, g_dem_count.load());     /* 3rd and 4th both pass immediately */
+}
+
+TEST_F(IdsMTest, ThresholdAccumulatesCount) {
+    /* threshold=5, SEvs carry count=2: 2+2 dropped, 2+2 -> 6>=5 pass */
+    auto sev = make_sev(0x8001);
+    sev.event_threshold = {5, 500};
+    init_with_sev(sev);
+
+    report_default(2);
+    report_default(2);
+    report_default(2);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(1, g_dem_count.load());     /* only the reaching SEv passed */
+}
+
+TEST_F(IdsMTest, ThresholdWindowExpiryResetsAccumulator) {
+    auto sev = make_sev(0x8001);
+    sev.event_threshold = {3, 100};
+    init_with_sev(sev);
+
+    report_n(2);                          /* accumulated 2 < 3 */
+    std::this_thread::sleep_for(std::chrono::milliseconds(250)); /* window expires */
+    report_n(1);                          /* fresh window: 1 < 3 -> dropped */
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(0, g_dem_count.load());
+
+    report_n(3);                          /* reaches 3 -> passes */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+}
+
+TEST_F(IdsMTest, ThresholdDisabledWhenZero) {
+    init_default();   /* event_threshold = {0, 0} */
+    report_n(3);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 3; }, 2000));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Filter chain order & short-circuit [SWS_IdsM_01004/01005]
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, ChainShortCircuitDownstreamCountersUntouched) {
+    /* BlockState drops -> ForwardNth counter and threshold accumulator must
+       not move [SWS_IdsM_01005]. After the block clears, the ForwardNth
+       counter still forwards the FIRST SEv (proving nothing was counted). */
+    static const IdsM_BlockStateFilterConfigType block_cfg = {{5}, 1};
+    auto sev = make_sev(0x8001);
+    sev.block_state         = &block_cfg;
+    sev.forward_every_nth   = 3;
+    sev.event_threshold     = {10, 500};
+    init_with_sev(sev);
+
+    IdsM_BswM_StateChanged(5);            /* block */
+    report_n(4);                          /* all dropped at BlockState */
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(0, g_dem_count.load());
+
+    IdsM_BswM_StateChanged(0);            /* unblock: ForwardNth counter still
+                                             at n=3 -> first SEv forwards */
+    report_default();                     /* 1 (fwd, thr 1<10) */
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_EQ(0, g_dem_count.load());     /* forwarded but below threshold */
+
+    report_n(10);                         /* accumulate to threshold */
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+}
+
+TEST_F(IdsMTest, ChainOrderAggregationBeforeThreshold) {
+    /* Fixed order: aggregation (stage) -> threshold. A staged aggregate does
+       NOT touch the threshold accumulator until the window releases it;
+       meanwhile fresh SEvs... none — aggregation absorbs everything. With
+       threshold=1 the released aggregate passes immediately on release. */
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 150;
+    sev.event_threshold         = {1, 500};
+    init_with_sev(sev);
+
+    report_n(3);
+    ASSERT_TRUE(wait_until([&]{ return g_dem_count.load() >= 1; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, g_dem_count.load());     /* single released aggregate */
+    EXPECT_EQ(3, g_last_count.load());
+}
+
+TEST_F(IdsMTest, ChainDisabledFiltersPassThrough) {
+    /* All filters disabled -> every SEv qualifies (chain optional) */
+    init_default();
+    report_n(5);
+    EXPECT_TRUE(wait_until([&]{ return g_dem_count.load() >= 5; }, 2000));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Config validation: time windows must be multiples of the MainFunction
+   period [SWS_IdsM_01064]
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+TEST_F(IdsMTest, InitRejectsNonMultipleAggregationInterval) {
+    auto sev = make_sev(0x8001);
+    sev.aggregation_interval_ms = 205;    /* not a multiple of period 10 */
+    auto cfg = make_config(&sev, 1);
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_Init(&cfg));
+}
+
+TEST_F(IdsMTest, InitRejectsNonMultipleThresholdInterval) {
+    auto sev = make_sev(0x8001);
+    sev.event_threshold = {3, 55};        /* not a multiple of period 10 */
+    auto cfg = make_config(&sev, 1);
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_Init(&cfg));
+}
+
+TEST_F(IdsMTest, InitRejectsZeroMainFunctionPeriod) {
+    auto sev = make_sev(0x8001);
+    auto cfg = make_config(&sev, 1);
+    cfg.main_function_period_ms = 0;
+    EXPECT_EQ(E_PARAM_CONFIG, IdsM_Init(&cfg));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    QSEv structure (CP §7.8.1)
    ═══════════════════════════════════════════════════════════════════════════ */
 
