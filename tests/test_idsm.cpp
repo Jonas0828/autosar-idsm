@@ -504,7 +504,10 @@ TEST_F(IdsMTest, ChainShortCircuitDownstreamCountersUntouched) {
     auto sev = make_sev(0x8001);
     sev.block_state         = &block_cfg;
     sev.forward_every_nth   = 3;
-    sev.event_threshold     = {10, 500};
+    /* n=3 forwards exactly 4 of the 11 post-unblock SEvs (1st, 6th, 9th ...
+       counter accumulates 1 per SEv from n) — threshold 4 is the exact count
+       the forwarded stream can reach here. */
+    sev.event_threshold     = {4, 500};
     init_with_sev(sev);
 
     IdsM_BswM_StateChanged(5);            /* block */

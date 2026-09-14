@@ -36,6 +36,17 @@ typedef uint8_t  IdsM_SensorInstanceIdType;         /* 0..63  [PRS_Ids_00014] */
 /* IdsM instance ID: 10 bit (0..1023) [PRS_Ids_00013] */
 #define IDSM_INSTANCE_ID_MAX  1023u
 
+/* ── IdsM internal SEvs (CP §7.4 / [SWS_IdsM_91015]) ───────────────────────
+   Raised by the IdsM itself (AUTOSAR-internal Event Definition IDs).
+   Internal SEvs are exempt from the instance-level filters (rate/traffic
+   limitation) [SWS_IdsM_00803]; their own SEv filter chain still applies
+   [SWS_IdsM_00804]. */
+#define SEV_IDSM_NO_EVENT_BUFFER_AVAILABLE            ((IdsM_ExternalSecurityEventIdType)46u)
+#define SEV_IDSM_NO_CONTEXT_DATA_BUFFER_AVAILABLE     ((IdsM_ExternalSecurityEventIdType)47u)
+#define SEV_IDSM_TRAFFIC_LIMITATION_EXCEEDED          ((IdsM_ExternalSecurityEventIdType)48u)
+#define SEV_IDSM_COMMUNICATION_ERROR                  ((IdsM_ExternalSecurityEventIdType)49u)
+#define SEV_IDSM_NO_QUALIFIED_EVENT_BUFFER_AVAILABLE  ((IdsM_ExternalSecurityEventIdType)87u)
+
 /* ── Detection Status (project extension, not in CP spec) ────────────────── */
 typedef enum {
     IDSM_STATUS_OK              = 0x00,

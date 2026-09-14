@@ -91,11 +91,28 @@ autosar-idsm-toolkit/
 │   ├── IdsRm.c                    # IDSRM C wrapper
 │   └── IdsRm_Manager.cpp          # IDSRM async HTTP forwarding (libcurl)
 ├── apps/
-│   └── idsm_cli/
-│       └── main.cpp               # Interactive CLI — 5 monitors (CAN, SecOC, Ethernet, OBD-II, FW)
+│   ├── idsm_cli/
+│   │   └── main.cpp               # Interactive CLI — 5 monitors (CAN, SecOC, Ethernet, OBD-II, FW)
+│   ├── eth_probe/                 # Lightweight Ethernet IDS probe (rail A, Linux)
+│   │   ├── packet.h/.cpp          # L2-L4 parser (Ethernet/VLAN/ARP/IPv4/IPv6/TCP/UDP/ICMP)
+│   │   ├── ip_defrag.h/.cpp       # IP fragment reassembly (capped, LRU eviction)
+│   │   ├── stream_tcp.h/.cpp      # TCP stream reassembly (gap-skip, memory caps)
+│   │   ├── rules.h/.cpp           # Suricata-syntax-subset rule engine (+pcre2 optional)
+│   │   ├── proto_doip/someip/tls/http/dns.* # app-layer parsers (DoIP, SOME/IP+SD,
+│   │   │                          #   TLS metadata/JA3, HTTP/1.1, DNS)
+│   │   ├── geoip.h/.cpp           # CIDR cross-border analysis (prefix trie)
+│   │   ├── detectors.h/.cpp       # port scan / rate flood / flag anomaly / ARP spoof
+│   │   ├── pipeline.h/.cpp        # detection pipeline wiring everything together
+│   │   ├── capture.h/.cpp         # AF_PACKET live capture + pcap replay
+│   │   ├── main.cpp               # probe entry: alerts → IdsM_ReportSecurityEvent()
+│   │   └── rules/                 # example.rules + trimmed chnroutes.txt
+│   └── eve_bridge/                # Suricata EVE → IDSM bridge (rail B)
+│       ├── eve.h/.cpp             # minimal EVE JSON alert parser
+│       └── main.cpp               # unix_stream listener → IdsM_ReportSecurityEvent()
 ├── tests/
-│   ├── test_idsm.cpp              # 20 IDSM unit tests (Google Test)
-│   ├── test_idsrm.cpp             # 19 IDSRM unit + integration tests
+│   ├── test_idsm.cpp              # IDSM unit tests (Google Test)
+│   ├── test_idsrm.cpp             # IDSRM unit + integration tests
+│   ├── eth_probe/                 # 88 eth_probe + eve_bridge tests
 │   └── mock_soc_server.py         # Python mock SOC endpoint for local testing
 ├── tools/
 │   └── soc_dashboard_cloud/
@@ -105,6 +122,62 @@ autosar-idsm-toolkit/
 │       ├── vercel.json            # Vercel routing + CORS config
 │       └── package.json           # No runtime deps — deploy via npx vercel@latest --prod
 └── CMakeLists.txt
+```
+
+---
+
+## Ethernet IDS Probe (eth_probe) — Rail A
+
+Lightweight self-contained Ethernet IDS probe (no Suricata/libpcap dependency),
+built for embedded targets. Alerts enter the IDSM filter chain as a single SEv
+(ext `0x8003`, context layout v1) and flow through IDSRM to the SOC.
+
+**Detectors** (detector_type in context data):
+
+| # | Detector | Notes |
+|:--|:---|:---|
+| 1 | Port scan | unique dst ports per source in sliding window |
+| 2 | Rate flood | pps per source, pre-aggregated count |
+| 3 | TCP flag anomaly | NULL / Xmas / SYN+FIN |
+| 4 | Rule engine hit | Suricata-syntax subset (content/pcre/http_*/dns_query) |
+| 5 | DoIP (ISO 13400) | malformed headers, routing-activation (GB 44496 surface) |
+| 6 | SOME/IP + SD | malformed headers, SD offer whitelist, session-wrap |
+| 7 | Reassembly resource | defrag/stream cap eviction |
+| 8 | Cross-border IP | outbound to non-domestic dst (CIDR prefix trie) |
+| 9 | TLS metadata | ClientHello SNI / version / JA3 (no decryption) |
+| 10 | HTTP/1.1 | malformed, overlong URI |
+| 11 | DNS | suspicious qtypes, illegal qnames |
+| 12 | ARP spoof | binding change, gratuitous storm |
+
+**Run** (Linux, live capture requires root):
+
+```bash
+sudo ./build/eth_probe -i eth0 --rules apps/eth_probe/rules/example.rules \
+    --cidr apps/eth_probe/rules/chnroutes.txt
+./build/eth_probe --pcap sample.pcap --rules ... --cidr ...   # offline replay
+```
+
+**Regulatory mapping** (GB 44495-2024 / GB 44496-2024): port scan (1), DoS (2),
+malformed data (3/5/6), known-attack signatures (4), unauthorized diagnostic
+access (4/5), network spoofing (12), data-export monitoring (8), event
+recording & reporting (IDSM/IDSRM core). CAN-bus detection is out of scope
+(separate CAN sensor over the same IDSM API).
+
+## Suricata Bridge (eve_bridge) — Rail B
+
+Full-capability detection on HIL/gateway hosts: run stock Suricata (official
+autotools build, untouched) with `eve-log` `filetype: unix_stream` and let
+`eve_bridge` forward its alerts into the same IDSM pipeline as SEv ext
+`0x8006` / sensor instance 1 (detector_type 100, aux = signature_id).
+
+Suricata source lives outside the project build at `third_party/suricata/`
+(release tarball committed for offline servers; unpack with
+`third_party/suricata/fetch.sh`, then `./configure && make` the official way —
+it is intentionally NOT part of the CMake build).
+
+```bash
+./build/eve_bridge --sock /tmp/suricata-eve.sock --soc http://localhost:8080/api/idsm-violations
+# suricata.yaml:  outputs → eve-log → filetype: unix_stream, filename: /tmp/suricata-eve.sock
 ```
 
 ---
@@ -368,6 +441,7 @@ void onCanFrameReceived(const CanFrame& frame) {
 | **Compiler** | GCC 11+ / Clang 14+ | `sudo pacman -S base-devel` | `sudo apt install build-essential` |
 | **Build System** | CMake 3.16+ | `sudo pacman -S cmake` | `sudo apt install cmake` |
 | **libcurl** | Required for IDSRM | `sudo pacman -S curl` | `sudo apt install libcurl4-openssl-dev` |
+| **pcre2** | Optional (eth_probe pcre rules) | `sudo pacman -S pcre2` | `sudo apt install libpcre2-dev` |
 | **Python 3** | Optional (mock SOC server) | pre-installed | pre-installed |
 
 ### Compile

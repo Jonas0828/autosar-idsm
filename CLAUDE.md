@@ -33,7 +33,7 @@ ctest --test-dir build --output-on-failure          # run all tests
 python3 tests/mock_soc_server.py 8080               # local mock SOC endpoint for manual testing
 ```
 
-Targets: `idsm_core` (IDSM static lib, incl. `IdsM_Protocol.c` serializer), `idsrm_core` (IDSRM static lib, links libcurl + idsm_core), `idsm_cli`, `test_idsm`, `test_idsrm`. GoogleTest is fetched via CMake FetchContent — **the server has slow GitHub access**, so googletest 1.14.0 is pre-staged at `~/work/deps/googletest-1.14.0`; always pass `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST` when configuring a fresh build tree.
+Targets: `idsm_core` (IDSM static lib, incl. `IdsM_Protocol.c` serializer), `idsrm_core` (IDSRM static lib, links libcurl + idsm_core), `idsm_cli`, `eth_probe` + `eth_probe_lib` (Ethernet IDS probe, Linux-only), `eve_bridge` (Suricata EVE→IDSM bridge), `test_idsm`, `test_idsrm`, `test_eth_probe`. GoogleTest is fetched via CMake FetchContent — **the server has slow GitHub access**, so googletest 1.14.0 is pre-staged at `~/work/deps/googletest-1.14.0`; always pass `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST` when configuring a fresh build tree. pcre2 is optional (`libpcre2-dev`): without it eth_probe skips pcre rules at load.
 
 ## Architecture
 
@@ -54,6 +54,7 @@ Key structural facts that span multiple files:
 - **All public APIs must stay non-blocking and thread-safe**: `IdsM_ReportSecurityEvent()` is enqueue-only (<1µs). Qualification and sink dispatch happen on the worker thread. IDSRM registers itself as the **IdsR sink** via `IdsM_RegisterIdsrSink()` in `IdsRm_Init()` and likewise just enqueues; HTTP happens on IDSRM's own thread with exponential-backoff retries.
 - **Init ordering matters**: `IdsRm_Init()` requires `IdsM_Init()` to have run first; shutdown is the reverse (`IdsRm_DeInit()` then `IdsM_DeInit()`).
 - **Event ID ranges**: 0x0000–0x7FFF AUTOSAR internal (Firewall SEvs 50–77), 0x8000–0xFFFE OEM (this project's sensors), 0xFFFF invalid.
+- **Sensors (detectors)**: two rails feed the pipeline via `IdsM_ReportSecurityEvent()`. **Rail A** `apps/eth_probe/` — self-contained Ethernet probe (packet parse → IP defrag → TCP reassembly → DoIP/SOME-IP+SD/TLS/HTTP/DNS parsers → Suricata-subset rule engine + packet detectors + cross-border GeoIP). Single SEv ext 0x8003, 46-byte context layout v1 (`detector_type` 1–12 in `apps/eth_probe/alert.h`). **Rail B** `apps/eve_bridge/` — stock Suricata (source at `third_party/suricata/`, official autotools build, **not** part of CMake) + unix_stream EVE listener; SEv ext 0x8006 / sensor 1, detector_type 100. Context layout rule: different layouts must use different external event IDs (design doc §7).
 - **Cloud SOC stack** (`tools/soc_dashboard_cloud/`) is a separate deployable: a Vercel serverless ingest function → InfluxDB → Grafana. No runtime npm deps; deploy with `npx vercel@latest --prod`. It is not part of the CMake build.
 
 ## Conventions

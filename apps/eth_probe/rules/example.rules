@@ -1,0 +1,27 @@
+# eth_probe example rules (Suricata-syntax subset)
+# Supported: alert tcp|udp|icmp|ip, any/CIDR/$VAR/negation, ports incl. ranges,
+# content (with |hex|), nocase, offset/depth/distance/within, pcre (if pcre2),
+# http_method/http_uri/http_header/dns_query sticky buffers, msg/sid/rev.
+#
+# 1xxx   UDS diagnostics over DoIP (GB 44496 unauthorized-flashing surface)
+# 2xxx   SOME/IP
+# 3xxx   HTTP/DNS
+
+# UDS SecurityAccess request (27 01) — diagnostic session abuse indicator
+alert tcp any any -> any 13400 (msg:"UDS SecurityAccess request"; sid:1000001; rev:1; content:"|27 01|";)
+# UDS Programming session request (10 02)
+alert tcp any any -> any 13400 (msg:"UDS DiagnosticSessionControl programming"; sid:1000002; rev:1; content:"|10 02|";)
+# UDS WriteDataByIdentifier (2E) — potential flash/config write
+alert tcp any any -> any 13400 (msg:"UDS WriteDataByIdentifier"; sid:1000003; rev:1; content:"|2E|";)
+# UDS RequestDownload/Upload (34/35) — flashing primitives
+alert tcp any any -> any 13400 (msg:"UDS RequestDownload/Upload"; sid:1000004; rev:1; content:"|34|";)
+alert tcp any any -> any 13400 (msg:"UDS RequestUpload"; sid:1000005; rev:1; content:"|35|";)
+# UDS RequestTransferExit (37) — flashing tail
+alert tcp any any -> any 13400 (msg:"UDS RequestTransferExit"; sid:1000006; rev:1; content:"|37|";)
+
+# HTTP admin/config endpoints on the vehicle net
+alert tcp any any -> any any (msg:"HTTP admin endpoint access"; sid:3000001; rev:1; http_uri; content:"/admin"; nocase;)
+alert tcp any any -> any any (msg:"HTTP firmware upload path"; sid:3000002; rev:1; http_uri; content:"/flash"; nocase;)
+
+# DNS zone transfer / ANY queries (recon, tunneling)
+alert udp any any -> any 53 (msg:"DNS ANY query"; sid:3000003; rev:1; content:"|00 FF 00 01|"; offset:2; depth:64;)
