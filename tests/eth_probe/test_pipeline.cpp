@@ -251,6 +251,47 @@ TEST(PipelineTest, CrossBorderAlertsWithCooldown) {
     EXPECT_EQ(hits[0].dst_ip[0], 8);
 }
 
+TEST(PipelineTest, MulticastAndBroadcastNeverCrossBorder) {
+    // Arrange
+    Collector c;
+    const std::string cidr_path = "/tmp/eth_probe_pipe_cidrs2.txt";
+    FILE* f = std::fopen(cidr_path.c_str(), "w");
+    std::fputs("1.0.1.0/24\n", f);
+    std::fclose(f);
+    ASSERT_TRUE(c.pipe.geoip().load_cidrs(cidr_path));
+    std::remove(cidr_path.c_str());
+
+    auto mk = [](uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3) {
+        std::vector<uint8_t> v;
+        put_bytes(v, {0x02, 0, 0, 0, 0, 1});
+        put_bytes(v, {0x02, 0, 0, 0, 0, 2});
+        put16(v, 0x0800);
+        v.push_back(0x45); v.push_back(0);
+        put16(v, 20 + 9);
+        put16(v, 1); put16(v, 0);
+        v.push_back(64); v.push_back(IP_PROTO_UDP);
+        put16(v, 0);
+        put_bytes(v, {172, 16, 51, 152});   /* home src */
+        put_bytes(v, {d0, d1, d2, d3});
+        const auto dgram = udp_dgram(5353, 5353, {0xAA});
+        v.insert(v.end(), dgram.begin(), dgram.end());
+        return v;
+    };
+
+    // Act: mDNS multicast, link-local, broadcast — none should alert
+    auto mdns = mk(224, 0, 0, 251);
+    c.pipe.feed_frame(mdns.data(), mdns.size(), 0);
+    auto llmnr = mk(224, 0, 0, 252);
+    c.pipe.feed_frame(llmnr.data(), llmnr.size(), 10);
+    auto linklocal = mk(169, 254, 1, 1);
+    c.pipe.feed_frame(linklocal.data(), linklocal.size(), 20);
+    auto bcast = mk(255, 255, 255, 255);
+    c.pipe.feed_frame(bcast.data(), bcast.size(), 30);
+
+    // Assert: zero cross-border alerts
+    EXPECT_TRUE(c.of_type(DT_CROSS_BORDER).empty());
+}
+
 TEST(PipelineTest, FragmentedUdpReassembledThenInspected) {
     // Arrange: UDP datagram split into two IPv4 fragments
     Collector c;

@@ -137,6 +137,17 @@ struct ProbePipeline::Impl {
     void check_cross_border(const ParsedPacket& pp, uint64_t now_ms) {
         if (!cfg.cross_border_enabled || !geoip_.loaded()) return;
         const bool v6 = pp.is_ipv6;
+        /* multicast / broadcast / link-local destinations are local by
+           definition — never cross-border (mDNS 224.0.0.251, LLMNR, SSDP,
+           IPv6 ff02::/16, IPv4 broadcast 255.255.255.255 ...) */
+        if (!v6) {
+            if ((pp.dst_ip[0] & 0xF0) == 0xE0) return;       /* 224.0.0.0/4 */
+            if (pp.dst_ip[0] == 169 && pp.dst_ip[1] == 254) return;
+            if (pp.dst_ip[0] == 255) return;                  /* broadcast */
+        } else {
+            if (pp.dst_ip[0] == 0xFF) return;                 /* ff00::/8 */
+            if (pp.dst_ip[0] == 0xFE && (pp.dst_ip[1] & 0xC0) == 0x80) return;
+        }
         /* outbound only: src inside the vehicle, dst outside */
         if (geoip_.classify(pp.src_ip, v6) != GeoIp::Verdict::HOME) return;
         if (geoip_.classify(pp.dst_ip, v6) != GeoIp::Verdict::FOREIGN) return;
