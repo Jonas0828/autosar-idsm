@@ -25,10 +25,44 @@ Returns:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import struct
 import sys
 
 VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 ENDPOINT = "/api/idsm-violations"
+
+# detector_type → human-readable name (apps/eth_probe/alert.h)
+DETECTOR_NAMES = {
+    1: "PORT_SCAN", 2: "RATE_FLOOD", 3: "FLAG_ANOMALY", 4: "RULE_HIT",
+    5: "DOIP", 6: "SOME_IP", 7: "REASSEMBLY", 8: "CROSS_BORDER",
+    9: "TLS", 10: "HTTP", 11: "DNS", 12: "ARP_SPOOF", 100: "SURICATA",
+}
+PROTO_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6"}
+
+
+def decode_context(payload_hex: str) -> str:
+    """Decode the 46-byte eth_probe/eve_bridge context layout v1 into a
+    human-readable summary. Returns empty string for other layouts."""
+    try:
+        raw = bytes.fromhex(payload_hex)
+    except ValueError:
+        return ""
+    if len(raw) != 46:
+        return ""
+    (det_type, proto, sport, dport) = struct.unpack(">BBHH", raw[:6])
+    src = raw[6:22]
+    dst = raw[22:38]
+    count, aux = struct.unpack(">II", raw[38:46])
+
+    def ip_str(b: bytes) -> str:
+        if b[4:] == b"\x00" * 12:  # IPv4 in first 4 bytes
+            return ".".join(str(x) for x in b[:4])
+        return ":".join(f"{b[i]:02x}{b[i+1]:02x}" for i in range(0, 16, 2)).lstrip("0")
+
+    det = DETECTOR_NAMES.get(det_type, f"TYPE_{det_type}")
+    proto_s = PROTO_NAMES.get(proto, str(proto))
+    return (f"{det} {proto_s} {ip_str(src)}:{sport} -> {ip_str(dst)}:{dport}"
+            f" aux=0x{aux:08X} x{count}")
 
 
 class SocHandler(BaseHTTPRequestHandler):
@@ -52,15 +86,17 @@ class SocHandler(BaseHTTPRequestHandler):
             assert event["severity"] in VALID_SEVERITIES, \
                 f"invalid severity: {event['severity']}"
 
+            decoded = decode_context(event["payload"])
             print(
                 f"[SOC] event=0x{event['event_id']:04X}"
                 f"  idsm={event.get('idsm_instance_id', '?')}"
                 f"  sensor={event.get('sensor_instance_id', '?')}"
                 f"  count={event['count']}"
                 f"  severity={event['severity']:<8}"
-                f"  payload={event['payload']}"
+                + (f"\n      >> {decoded}" if decoded else "")
+                + f"\n      payload={event['payload']}"
                 f"  len={event.get('payload_len', '?')}"
-                f"  msg={event['ids_message']}",
+                f"\n      msg={event['ids_message']}",
                 flush=True
             )
 
