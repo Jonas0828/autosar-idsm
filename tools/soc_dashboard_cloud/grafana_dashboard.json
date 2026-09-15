@@ -19,7 +19,7 @@
     { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
   ],
   "annotations": { "list": [] },
-  "description": "AUTOSAR IDSM/IDSR Security Violations SOC Dashboard",
+  "description": "AUTOSAR IDSM/IDSR Security Violations SOC Dashboard (R24-11, eth_probe + eve_bridge)",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -85,9 +85,7 @@
     },
     {
       "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-      "fieldConfig": {
-        "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } }
-      },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } },
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "id": 3,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" },
@@ -104,15 +102,31 @@
     {
       "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" } } },
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 1 },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
       "id": 4,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "value" },
-      "title": "Active Monitors",
+      "title": "Active Sensors",
       "type": "stat",
       "targets": [
         {
           "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"monitor_id\"])\n  |> distinct(column: \"monitor_id\")\n  |> count()",
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"sensor_instance\"])\n  |> distinct(column: \"sensor_instance\")\n  |> count()",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" } } },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "id": 14,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "value" },
+      "title": "Active Detectors",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"detector\"])\n  |> distinct(column: \"detector\")\n  |> count()",
           "refId": "A"
         }
       ]
@@ -150,15 +164,7 @@
     },
     {
       "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-      "fieldConfig": {
-        "defaults": { "color": { "mode": "palette-classic" } },
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "CRITICAL" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "HIGH" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "MEDIUM" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "LOW" }, "properties": [{ "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
-        ]
-      },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" } } },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
       "id": 6,
       "options": { "pieType": "donut", "displayLabels": ["percent", "name"], "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] } },
@@ -176,41 +182,37 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
       "id": 12,
-      "title": "Per-Monitor Breakdown",
+      "title": "Detector Breakdown",
       "type": "row"
     },
     {
       "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-      "fieldConfig": {
-        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80 } }
-      },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80 } } },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "id": 7,
-      "options": { "barWidth": 0.7, "groupWidth": 0.7, "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" }, "xField": "monitor_id" },
-      "title": "Violations per Monitor",
+      "options": { "barWidth": 0.7, "groupWidth": 0.7, "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" }, "xField": "detector" },
+      "title": "Violations per Detector",
       "type": "barchart",
       "targets": [
         {
           "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"monitor_id\"])\n  |> count()\n  |> rename(columns: {_value: \"violations\"})\n  |> group()\n  |> sort(columns: [\"violations\"], desc: true)",
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"detector\"])\n  |> count()\n  |> rename(columns: {_value: \"violations\"})\n  |> group()\n  |> sort(columns: [\"violations\"], desc: true)",
           "refId": "A"
         }
       ]
     },
     {
       "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-      "fieldConfig": {
-        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
-      },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2, "fillOpacity": 5 } } },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "id": 8,
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
-      "title": "Top Monitors Over Time",
+      "title": "Detectors Over Time",
       "type": "timeseries",
       "targets": [
         {
           "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> aggregateWindow(every: v.windowPeriod, fn: count, createEmpty: false)\n  |> group(columns: [\"monitor_id\"])",
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> aggregateWindow(every: v.windowPeriod, fn: count, createEmpty: false)\n  |> group(columns: [\"detector\"])",
           "refId": "A"
         }
       ]
@@ -219,6 +221,45 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
       "id": 13,
+      "title": "Top Talkers",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 15,
+      "options": { "barWidth": 0.7, "groupWidth": 0.7, "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" }, "xField": "src_ip" },
+      "title": "Top Source IPs",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"src_ip\")\n  |> group(columns: [\"_value\"])\n  |> count()\n  |> rename(columns: {_value: \"src_ip\"})\n  |> group()\n  |> sort(columns: [\"violations\"], desc: true)\n  |> limit(n: 15)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 80 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 16,
+      "options": { "barWidth": 0.7, "groupWidth": 0.7, "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" }, "xField": "dst_ip" },
+      "title": "Top Destination IPs",
+      "type": "barchart",
+      "targets": [
+        {
+          "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"dst_ip\")\n  |> group(columns: [\"_value\"])\n  |> count()\n  |> rename(columns: {_value: \"dst_ip\"})\n  |> group()\n  |> sort(columns: [\"violations\"], desc: true)\n  |> limit(n: 15)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 17,
       "title": "Recent Events",
       "type": "row"
     },
@@ -237,12 +278,13 @@
             ]},
             { "id": "custom.displayMode", "value": "color-background" }
           ]},
-          { "matcher": { "id": "byName", "options": "monitor_id" }, "properties": [{ "id": "custom.width", "value": 120 }] },
+          { "matcher": { "id": "byName", "options": "detector" }, "properties": [{ "id": "custom.width", "value": 130 }] },
+          { "matcher": { "id": "byName", "options": "summary" }, "properties": [{ "id": "custom.width", "value": 420 }] },
           { "matcher": { "id": "byName", "options": "payload" }, "properties": [{ "id": "custom.width", "value": 200 }] },
           { "matcher": { "id": "byName", "options": "_time" }, "properties": [{ "id": "displayName", "value": "Time" }, { "id": "custom.width", "value": 180 }] }
         ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 33 },
       "id": 9,
       "options": { "sortBy": [{ "displayName": "Time", "desc": true }], "footer": { "show": false } },
       "title": "Latest 100 Events",
@@ -250,7 +292,7 @@
       "targets": [
         {
           "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
-          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\" or r._field == \"timestamp_ms\" or r._field == \"payload\" or r._field == \"payload_len\")\n  |> pivot(rowKey: [\"_time\", \"severity\", \"monitor_id\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 100)",
+          "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\" or r._field == \"count\" or r._field == \"summary\" or r._field == \"src_ip\" or r._field == \"dst_ip\" or r._field == \"aux\" or r._field == \"proto\")\n  |> pivot(rowKey: [\"_time\", \"severity\", \"detector\", \"sensor_instance\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 100)",
           "refId": "A"
         }
       ]
@@ -271,6 +313,19 @@
         "refresh": 1,
         "type": "datasource",
         "label": "Data Source"
+      },
+      {
+        "datasource": { "type": "influxdb", "uid": "${DS_INFLUXDB}" },
+        "definition": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"detector\"])\n  |> distinct(column: \"detector\")",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Detector",
+        "multi": true,
+        "name": "detector",
+        "options": [],
+        "query": "from(bucket: v.defaultBucket)\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"idsm_violations\")\n  |> filter(fn: (r) => r._field == \"event_id\")\n  |> group(columns: [\"detector\"])\n  |> distinct(column: \"detector\")",
+        "refresh": 2,
+        "type": "query"
       }
     ]
   },
@@ -279,5 +334,5 @@
   "timezone": "browser",
   "title": "IDSM/IDSR SOC Dashboard",
   "uid": "idsm-soc-dashboard",
-  "version": 1
+  "version": 2
 }
