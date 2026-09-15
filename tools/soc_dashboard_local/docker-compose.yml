@@ -1,0 +1,47 @@
+# Local SOC stack for the AUTOSAR IDSM toolkit (HIL / lab use, no cloud needed).
+#
+#   docker compose up -d
+#
+# Then:
+#   InfluxDB UI  : http://<host>:8086  (admin / password set below)
+#   Grafana UI   : http://<host>:3000  (admin / admin, change on first login)
+#   SOC ingest   : http://<host>:9000/api/idsm-violations  (from server.js)
+#
+# Point the probe at it:
+#   ./build/eth_probe -i eth1 --soc http://<host>:9000/api/idsm-violations ...
+#
+# Local SOC stack for the AUTOSAR IDSM toolkit (HIL / lab use, no cloud needed).
+#
+#   docker compose up -d
+#
+# InfluxDB runs in Docker; Grafana is installed natively (apt or tarball) —
+# free CN registry mirrors 403 the grafana/grafana repo, so don't fight it.
+#
+# Then:
+#   InfluxDB UI  : http://<host>:8086  (admin / password set below)
+#   Grafana UI   : http://<host>:3000  (native install, see README)
+#   SOC ingest   : http://<host>:9000/api/idsm-violations  (from server.js)
+#
+# Point the probe at it:
+#   ./build/eth_probe -i eth1 --soc http://<host>:9000/api/idsm-violations ...
+
+services:
+  influxdb:
+    image: docker.m.daocloud.io/library/influxdb:2.7
+    container_name: idsm-influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      # CHANGE THESE for anything beyond a lab bench:
+      DOCKER_INFLUXDB_INIT_PASSWORD: idsm-admin-pass
+      DOCKER_INFLUXDB_INIT_ORG: idsm
+      DOCKER_INFLUXDB_INIT_BUCKET: idsm
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: idsm-admin-token
+    volumes:
+      - influx-data:/var/lib/influxdb2
+
+volumes:
+  influx-data:
