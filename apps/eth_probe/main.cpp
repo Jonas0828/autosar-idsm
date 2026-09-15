@@ -50,6 +50,7 @@ struct Args {
     uint16_t someip_port = ethprobe::SOMEIP_DEFAULT_PORT;
     std::vector<uint16_t> someip_services;
     uint32_t scan_ports = 0;   /* 0 = default */
+    uint32_t scan_window_ms = 0; /* 0 = default */
     uint32_t flood_pps  = 0;
     std::string trusted_sources;  /* comma-separated CIDRs */
     bool help = false;
@@ -74,6 +75,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--someip-port") a.someip_port = static_cast<uint16_t>(
             std::stoul(next("--someip-port")));
         else if (s == "--scan-ports") a.scan_ports = std::stoul(next("--scan-ports"));
+        else if (s == "--scan-window") a.scan_window_ms = std::stoul(next("--scan-window"));
         else if (s == "--flood-pps") a.flood_pps = std::stoul(next("--flood-pps"));
         else if (s == "--trusted") a.trusted_sources = next("--trusted");
         else if (s.rfind("--var", 0) == 0) {
@@ -126,6 +128,8 @@ void print_usage(const char* prog) {
         "  --someip-port N        SOME/IP port (default 30490)\n"
         "  --someip-services IDS  SOME/IP-SD offer whitelist (comma-sep, hex ok)\n"
         "  --scan-ports N         port-scan unique-port threshold (default 20)\n"
+        "  --scan-window MS       port-scan sliding window (default 10000 ms;\n"
+        "                         increase to 60000 to catch slow scans)\n"
         "  --flood-pps N          rate-flood pps threshold (default 1000)\n"
         "  --trusted CIDR,...     trusted source IPs (known mgmt/monitoring hosts;\n"
         "                         their traffic never produces alerts)\n";
@@ -170,9 +174,10 @@ int main(int argc, char** argv) {
     /* ---- pipeline setup ---- */
     ethprobe::ProbePipeline pipeline(&report_alert);
     pipeline.config().someip_port = args.someip_port;
-    if (args.scan_ports > 0) {
-        pipeline.port_scan().set_config(
-            ethprobe::PortScanDetector::Config{10000, args.scan_ports});
+    if (args.scan_ports > 0 || args.scan_window_ms > 0) {
+        pipeline.port_scan().set_config(ethprobe::PortScanDetector::Config{
+            args.scan_window_ms > 0 ? args.scan_window_ms : 10000,
+            args.scan_ports > 0 ? args.scan_ports : 20});
     }
     if (args.flood_pps > 0) {
         pipeline.rate_flood().set_config(
