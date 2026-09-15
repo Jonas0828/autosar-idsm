@@ -93,6 +93,12 @@ struct ProbePipeline::Impl {
         ParsedPacket pp;
         if (!parse_packet(data, len, pp)) return;
 
+        /* trusted sources: drop before any detector runs */
+        if (!cfg.trusted_sources.empty() && (pp.is_ipv4 || pp.is_ipv6) &&
+            cfg.trusted_sources.contains(pp.src_ip, pp.is_ipv6)) {
+            return;
+        }
+
         if (pp.is_arp) {
             if (auto a = arp_.feed(pp, now_ms)) emit(*a);
             return;

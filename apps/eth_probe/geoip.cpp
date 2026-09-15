@@ -209,4 +209,47 @@ size_t GeoIp::cidr_count()  const {
     return m_->domestic_v4.inserted + m_->domestic_v6.inserted;
 }
 
+/* ---- CidrSet ---- */
+
+struct CidrSet::Impl {
+    Trie v4, v6;
+    size_t n = 0;
+};
+
+CidrSet::CidrSet() : m_(std::make_unique<Impl>()) {}
+CidrSet::~CidrSet() = default;
+
+bool CidrSet::add(const std::string& cidr) {
+    uint8_t addr[16]; uint8_t plen; bool v6;
+    if (!parse_addr_cidr(cidr, addr, plen, v6)) return false;
+    (v6 ? m_->v6 : m_->v4).insert(addr, plen, v6 ? 128 : 32);
+    ++m_->n;
+    return true;
+}
+
+bool CidrSet::add_list(const std::string& csv) {
+    size_t pos = 0;
+    while (pos <= csv.size()) {
+        const auto comma = csv.find(',', pos);
+        const std::string tok = csv.substr(
+            pos, comma == std::string::npos ? comma : comma - pos);
+        /* trim whitespace */
+        const auto b = tok.find_first_not_of(" \t");
+        if (b != std::string::npos) {
+            const auto e = tok.find_last_not_of(" \t");
+            if (!add(tok.substr(b, e - b + 1))) return false;
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return true;
+}
+
+bool CidrSet::contains(const uint8_t ip[16], bool is_v6) const {
+    return is_v6 ? m_->v6.contains(ip, 128) : m_->v4.contains(ip, 32);
+}
+
+bool   CidrSet::empty() const { return m_->n == 0; }
+size_t CidrSet::count() const { return m_->n; }
+
 } /* namespace ethprobe */

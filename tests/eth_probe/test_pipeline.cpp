@@ -292,6 +292,50 @@ TEST(PipelineTest, MulticastAndBroadcastNeverCrossBorder) {
     EXPECT_TRUE(c.of_type(DT_CROSS_BORDER).empty());
 }
 
+TEST(PipelineTest, TrustedSourcesSuppressAllAlerts) {
+    // Arrange: whitelist the scanning host 10.0.0.9
+    Collector c;
+    ASSERT_TRUE(c.pipe.config().trusted_sources.add_list("10.0.0.9/32"));
+    c.pipe.port_scan().set_config(PortScanDetector::Config{10000, 3});
+
+    // Act: same host port-scans (would alert without the whitelist)...
+    for (uint16_t port = 100; port <= 102; ++port) {
+        auto f = eth_ipv4(IP_PROTO_TCP, 9, 99, tcp_segment(49152, port, 1000, TCP_SYN));
+        c.pipe.feed_frame(f.data(), f.size(), port);
+    }
+    /* ...while a different host scanning is still caught */
+    for (uint16_t port = 100; port <= 102; ++port) {
+        auto f = eth_ipv4(IP_PROTO_TCP, 8, 99, tcp_segment(49152, port, 1000, TCP_SYN));
+        c.pipe.feed_frame(f.data(), f.size(), 500 + port);
+    }
+
+    // Assert: only the untrusted host produced an alert
+    auto scans = c.of_type(DT_PORT_SCAN);
+    ASSERT_EQ(scans.size(), 1u);
+    EXPECT_EQ(scans[0].src_ip[3], 8);
+}
+
+TEST(PipelineTest, CidrSetBasics) {
+    CidrSet s;
+    EXPECT_TRUE(s.empty());
+    ASSERT_TRUE(s.add_list("10.0.0.0/8, fd00::/8 , 192.168.1.5"));
+    EXPECT_EQ(s.count(), 3u);
+
+    uint8_t ip[16] = {};
+    ip[0] = 10; ip[3] = 77;
+    EXPECT_TRUE(s.contains(ip, false));
+    ip[0] = 11;
+    EXPECT_FALSE(s.contains(ip, false));
+
+    uint8_t v6[16] = {};
+    v6[0] = 0xfd;
+    EXPECT_TRUE(s.contains(v6, true));
+    v6[0] = 0x20;
+    EXPECT_FALSE(s.contains(v6, true));
+
+    EXPECT_FALSE(s.add_list("10.0.0.0/8,bogus"));
+}
+
 TEST(PipelineTest, FragmentedUdpReassembledThenInspected) {
     // Arrange: UDP datagram split into two IPv4 fragments
     Collector c;

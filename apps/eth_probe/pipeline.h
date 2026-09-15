@@ -35,6 +35,10 @@ public:
         uint16_t http_alt_port          = 8080;
         uint16_t tls_port               = 443;
         size_t   stream_acc_cap         = 64 * 1024; /* per-direction app buffer cap */
+        /* Sources whose traffic is trusted (known management/monitoring
+           hosts): frames from these IPs are dropped before any detector
+           runs, so they never produce alerts. */
+        CidrSet  trusted_sources;
     };
 
     using AlertCallback = std::function<void(const ProbeAlert&)>;

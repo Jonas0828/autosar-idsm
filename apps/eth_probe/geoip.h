@@ -18,6 +18,29 @@
 
 namespace ethprobe {
 
+/* Standalone CIDR set (prefix trie) — used for alert-source whitelisting
+   where no "loaded" gating or home/domestic semantics are wanted. */
+class CidrSet {
+public:
+    CidrSet();
+    ~CidrSet();
+    CidrSet(const CidrSet&) = delete;
+    CidrSet& operator=(const CidrSet&) = delete;
+
+    /* Add one CIDR ("10.0.0.0/8", "fd00::/8", bare IPs allowed). */
+    bool add(const std::string& cidr);
+    /* Parse a comma-separated list; returns false on first bad entry. */
+    bool add_list(const std::string& csv);
+
+    bool contains(const uint8_t ip[16], bool is_v6) const;
+    bool empty() const;
+    size_t count() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_;
+};
+
 class GeoIp {
 public:
     enum class Verdict : uint8_t {
