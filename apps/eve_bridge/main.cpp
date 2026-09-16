@@ -3,7 +3,7 @@
  *
  * Listens on a Unix stream socket for Suricata's eve-log (filetype:
  * unix_stream), parses each alert JSON line, and reports it as a Security
- * Event into the IDSM filter chain: SEv ext 0x8006 / sensor instance 1,
+ * Event into the IDSM filter chain: SEv ext 0x8010 / sensor instance 1,
  * detector_type 100 (DT_SURICATA), aux = Suricata signature_id.
  *
  * Reconnect-on-accept: the bridge is the listen side; Suricata connects.
@@ -29,7 +29,7 @@
 namespace {
 
 /* SEv symbolic name (simulate configuration-generated code) */
-#define SEV_SURICATA ((IdsM_SecurityEventIdType)0)  /* ext 0x8006 */
+#define SEV_SURICATA ((IdsM_SecurityEventIdType)0)  /* ext 0x8010 */
 
 /* detector_type 100 = DT_SURICATA (see apps/eth_probe/alert.h) */
 constexpr uint8_t DT_SURICATA = 100;
@@ -115,9 +115,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* ---- IDSM init: SEv ext 0x8006 / sensor instance 1 ---- */
+    /* ---- IDSM init: SEv ext 0x8010 / sensor instance 1 ---- */
     IdsM_SecurityEventConfigType sevs[1] = {
-        {0x8006, 1, IDSM_SEVERITY_HIGH, IDSM_REPORTING_DETAILED,
+        {0x8010, 1, IDSM_SEVERITY_HIGH, IDSM_REPORTING_DETAILED,
          nullptr, 0, 0 /* no aggregation: Suricata alerts are pre-filtered */,
          {0, 0}, true, true},
     };
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
         std::cerr << "[IDSM ERR] Init failed\n";
         return 1;
     }
-    std::cout << "[IDSM] Initialized | SEv 0: Suricata(ext 0x8006, sensor 1)\n";
+    std::cout << "[IDSM] Initialized | SEv 0: Suricata(ext 0x8010, sensor 1)\n";
 
     IdsRm_ConfigType idsrm_cfg{};
     std::strncpy(idsrm_cfg.soc_url, soc_url.c_str(), IDSRM_MAX_URL_LEN - 1);

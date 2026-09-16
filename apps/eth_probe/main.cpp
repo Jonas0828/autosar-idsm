@@ -28,8 +28,19 @@
 
 namespace {
 
-/* SEv symbolic name (simulate configuration-generated code) */
-#define SEV_ETH_PROBE ((IdsM_SecurityEventIdType)0)  /* ext 0x8003 */
+/* SEv symbolic names — one SEv per detector_type so aggregation windows
+   don't merge different alert kinds (each keeps its own context).
+   Internal ID = index into the SEv config array; ext ID = 0x8003 + index.
+   Detector types 1..12 → internal 0..11 (see apps/eth_probe/alert.h). */
+constexpr IdsM_SecurityEventIdType SEV_BASE = 0;  /* internal id of detector 1 */
+constexpr uint8_t MAX_DETECTOR_TYPE = 12;
+
+/* map detector_type (1..12) → internal SEv id (0..11); 0xFF = invalid */
+IdsM_SecurityEventIdType sev_for_detector(uint8_t detector_type) {
+    if (detector_type >= 1 && detector_type <= MAX_DETECTOR_TYPE)
+        return static_cast<IdsM_SecurityEventIdType>(detector_type - 1);
+    return 0xFFFF;
+}
 
 std::atomic<bool> g_stop{false};
 ethprobe::LiveCapture* g_cap = nullptr;
@@ -155,7 +166,9 @@ void report_alert(const ethprobe::ProbeAlert& a) {
     serialize_context(a, ctx);
     uint16_t count = static_cast<uint16_t>(a.count > 65535 ? 65535
                                            : (a.count == 0 ? 1 : a.count));
-    IdsM_ReportSecurityEvent(SEV_ETH_PROBE, ctx, sizeof(ctx),
+    const auto sev = sev_for_detector(a.detector_type);
+    if (sev == 0xFFFF) return;  /* unknown detector: drop */
+    IdsM_ReportSecurityEvent(sev, ctx, sizeof(ctx),
                              1 /* contextDataVersion */, count,
                              nullptr /* internal timestamp */);
     std::cout << "[PROBE] alert type=" << static_cast<int>(a.detector_type)
@@ -219,26 +232,31 @@ int main(int argc, char** argv) {
                   << " trusted source CIDRs (alerts suppressed)\n";
     }
 
-    /* ---- IDSM init (single SEv: ext 0x8003, all probe alerts) ---- */
-    IdsM_SecurityEventConfigType sevs[1] = {
-        /* extId,  inst, severity,           reporting mode,          filters...,        dem,  idsr */
-        {0x8003, 0, IDSM_SEVERITY_MEDIUM, IDSM_REPORTING_DETAILED,
-         nullptr, 0, 1000 /* aggregation window ms */, {0, 0}, true, true},
-    };
+    /* ---- IDSM init: one SEv per detector_type (ext 0x8003+i) so each kind
+       aggregates independently — different alert types never share a window
+       and never overwrite each other's context data. ---- */
+    IdsM_SecurityEventConfigType sevs[MAX_DETECTOR_TYPE];
+    for (uint8_t i = 0; i < MAX_DETECTOR_TYPE; ++i) {
+        sevs[i] = IdsM_SecurityEventConfigType{
+            static_cast<IdsM_ExternalSecurityEventIdType>(0x8003 + i),
+            0, IDSM_SEVERITY_MEDIUM, IDSM_REPORTING_DETAILED,
+            nullptr, 0, 1000 /* per-type aggregation window ms */, {0, 0},
+            true, true};
+    }
     IdsM_ConfigType idsm_cfg{};
     idsm_cfg.idsm_instance_id        = 1;
     idsm_cfg.main_function_period_ms = 10;
     idsm_cfg.rate_limitation         = {0, 0};
     idsm_cfg.traffic_limitation      = {0, 0};
     idsm_cfg.sev_configs             = sevs;
-    idsm_cfg.sev_count               = 1;
+    idsm_cfg.sev_count               = MAX_DETECTOR_TYPE;
     idsm_cfg.event_buffer_size       = 256;
 
     if (IdsM_Init(&idsm_cfg) != E_OK) {
         std::cerr << "[IDSM ERR] Init failed\n";
         return 1;
     }
-    std::cout << "[IDSM] Initialized | SEv 0: Ethernet-IDS(ext 0x8003)\n";
+    std::cout << "[IDSM] Initialized | 12 SEvs ext 0x8003-0x800E (one per detector type)\n";
 
     IdsRm_ConfigType idsrm_cfg{};
     std::strncpy(idsrm_cfg.soc_url, args.soc_url.c_str(), IDSRM_MAX_URL_LEN - 1);
@@ -289,9 +307,10 @@ int main(int argc, char** argv) {
     }
 
     /* ---- shutdown (reverse init order) ----
-       Flush the pending aggregation window first so tail alerts are not
+       Flush all pending aggregation windows first so tail alerts are not
        lost, then give IDSRM's HTTP worker a moment to drain its queue. */
-    IdsM_FlushEvents(SEV_ETH_PROBE);
+    for (uint8_t i = 0; i < MAX_DETECTOR_TYPE; ++i)
+        IdsM_FlushEvents(static_cast<IdsM_SecurityEventIdType>(i));
     std::this_thread::sleep_for(std::chrono::seconds(2));
     IdsRm_DeInit();
     IdsM_DeInit();
