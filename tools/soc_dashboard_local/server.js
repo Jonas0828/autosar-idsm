@@ -144,10 +144,67 @@ function writeToInflux(line) {
   });
 }
 
+/* DELETE all points in the bucket (InfluxDB delete API: predicate-less
+   deletes everything in the range). Returns InfluxDB's status code. */
+function clearInflux() {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${INFLUX_URL}/api/v2/delete?org=${encodeURIComponent(INFLUX_ORG)}` +
+      `&bucket=${encodeURIComponent(INFLUX_BUCKET)}`);
+    const mod = url.protocol === "https:" ? require("https") : http;
+    const body = JSON.stringify({
+      start: "1970-01-01T00:00:00Z",
+      stop: new Date(Date.now() + 86400000).toISOString(),  /* +1 day safety margin */
+    });
+    const req = mod.request(
+      {
+        method: "POST",
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        path: url.pathname + url.search,
+        headers: {
+          Authorization: `Token ${INFLUX_TOKEN}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", influx: INFLUX_URL }));
+    return;
+  }
+  /* clear endpoint: POST /api/clear → wipes the violations bucket */
+  if (req.method === "POST" && req.url === "/api/clear") {
+    if (!INFLUX_TOKEN) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "INFLUXDB_TOKEN not set (log-only mode)" }));
+      return;
+    }
+    try {
+      const status = await clearInflux();
+      if (status === 204) {
+        console.log("[SOC] bucket cleared via /api/clear");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "cleared" }));
+      } else {
+        console.error(`[SOC] clear failed: InfluxDB returned ${status}`);
+        res.writeHead(502).end(JSON.stringify({ error: "InfluxDB delete failed", status }));
+      }
+    } catch (err) {
+      console.error(`[SOC] clear failed: ${err.message}`);
+      res.writeHead(502).end(JSON.stringify({ error: "InfluxDB unreachable" }));
+    }
     return;
   }
   if (req.method !== "POST" || req.url !== "/api/idsm-violations") {
