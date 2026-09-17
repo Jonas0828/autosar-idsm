@@ -1,0 +1,21 @@
+# IdsmManager APK 域。平台签名应用经 seapp_contexts 映射进本域,
+# file_contexts 给规则目录打 idsm_manager_app_data_file 标签。
+type idsm_manager_app, domain;
+type idsm_manager_app_data_file, file_type, data_file_type;
+
+app_domain(idsm_manager_app)
+untrusted_app_domain(idsm_manager_app)
+
+# 云端 MQTT/TLS + 令牌服务
+allow idsm_manager_app self:tcp_socket { create connect read write };
+allow idsm_manager_app port:tcp_socket name_connect;
+allow idsm_manager_app node:tcp_socket node_connect;
+
+# 规则热更新通知 init 重启探针(属性需 property_service 注册 idsm_reload_prop)
+set_prop(idsm_manager_app, idsm_reload_prop)
+
+# 监听 abstract UDS "idsm_probe",接受探针连接
+allow idsm_manager_app self:unix_stream_socket { create bind listen accept read write };
+
+# 前台服务/通知
+allow idsm_manager_app app_api_service:service_manager find;

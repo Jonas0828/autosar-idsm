@@ -54,6 +54,8 @@ struct Args {
     std::string iface;
     std::string pcap;
     std::string soc_url = "http://localhost:8080/api/idsm-violations";
+    std::string sink;           /* UDS path to the IDSM manager APK (vehicle) */
+    bool        soc_given = false;
     std::string rules_file;
     std::string cidr_file;
     std::vector<std::string> home_nets;
@@ -80,7 +82,8 @@ Args parse_args(int argc, char** argv) {
         };
         if (s == "-i" || s == "--iface") a.iface = next("-i");
         else if (s == "--pcap") a.pcap = next("--pcap");
-        else if (s == "--soc") a.soc_url = next("--soc");
+        else if (s == "--soc") { a.soc_url = next("--soc"); a.soc_given = true; }
+        else if (s == "--sink") a.sink = next("--sink");
         else if (s == "--rules") a.rules_file = next("--rules");
         else if (s == "--cidr") a.cidr_file = next("--cidr");
         else if (s == "--someip-port") a.someip_port = static_cast<uint16_t>(
@@ -132,6 +135,10 @@ void print_usage(const char* prog) {
         "       " << prog << " --pcap <file> [options] (offline replay)\n"
         "options:\n"
         "  --soc URL              SOC endpoint (default http://localhost:8080/api/idsm-violations)\n"
+        "                         pass an empty URL with --sink to disable HTTP\n"
+        "  --sink PATH            local UDS sink (NDJSON) to the IDSM manager APK;\n"
+        "                         without --soc this replaces the HTTP path (vehicle)\n"
+        "                         '@name' selects an Android abstract socket\n"
         "  --rules FILE           Suricata-syntax-subset rules file\n"
         "  --var KEY=VALUE        rule variable (e.g. --var HOME_NET=10.0.0.0/8)\n"
         "  --cidr FILE            domestic CIDR list (enables cross-border detection)\n"
@@ -178,7 +185,7 @@ void report_alert(const ethprobe::ProbeAlert& a) {
 } /* namespace */
 
 int main(int argc, char** argv) {
-    const Args args = parse_args(argc, argv);
+    Args args = parse_args(argc, argv);
     if (args.help || (args.iface.empty() && args.pcap.empty())) {
         print_usage(argv[0]);
         return args.help ? 0 : 1;
@@ -258,6 +265,10 @@ int main(int argc, char** argv) {
     }
     std::cout << "[IDSM] Initialized | 12 SEvs ext 0x8003-0x800E (one per detector type)\n";
 
+    /* Vehicle mode: --sink without --soc means the HTTP path is off and
+       every event goes to the local UDS sink (manager APK). */
+    if (!args.sink.empty() && !args.soc_given) args.soc_url.clear();
+
     IdsRm_ConfigType idsrm_cfg{};
     std::strncpy(idsrm_cfg.soc_url, args.soc_url.c_str(), IDSRM_MAX_URL_LEN - 1);
     idsrm_cfg.auth_token[0] = '\0';
@@ -269,7 +280,10 @@ int main(int argc, char** argv) {
         IdsM_DeInit();
         return 1;
     }
-    std::cout << "[IDSRM] Initialized | Forwarding to " << idsrm_cfg.soc_url << "\n";
+    if (!args.sink.empty()) IdsRm_SetLocalSink(args.sink.c_str());
+    std::cout << "[IDSRM] Initialized | Forwarding to "
+              << (idsrm_cfg.soc_url[0] ? idsrm_cfg.soc_url : std::string("(local sink ") + args.sink + ")")
+              << "\n";
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

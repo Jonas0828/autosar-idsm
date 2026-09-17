@@ -2,11 +2,17 @@
 #include "IdsM.h"
 #include "IdsM_Protocol.h"
 #include <curl/curl.h>
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <deque>
+#include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 /* Forward declaration — defined in the C-bridge section at the bottom */
 extern "C" void IdsRm_Core_IdsrSinkShim(const IdsM_QualifiedSecurityEventType* qsev);
@@ -60,6 +66,15 @@ STD_RETURN_TYPE IdsRm_Manager::Init(const IdsRm_ConfigType* config) {
     m_worker_running.store(true);
     m_worker_thread = std::thread(&IdsRm_Manager::worker_loop, this);
 
+    /* Local UDS sink (production path to the IDSM manager APK) */
+    {
+        std::lock_guard<std::mutex> slock(m_sink_mutex);
+        if (!m_sink_path.empty()) {
+            m_sink_running.store(true);
+            m_sink_thread = std::thread(&IdsRm_Manager::sink_loop, this);
+        }
+    }
+
     m_initialized.store(true);
     return E_OK;
 }
@@ -75,6 +90,14 @@ STD_RETURN_TYPE IdsRm_Manager::DeInit() {
     if (m_worker_thread.joinable()) {
         m_worker_thread.join();
     }
+
+    m_sink_running.store(false);
+    m_sink_cv.notify_all();
+    if (m_sink_thread.joinable()) {
+        m_sink_thread.join();
+    }
+    sink_close();
+
     /* curl handle cleaned up inside worker_loop before it returns */
 
     m_initialized.store(false);
@@ -116,6 +139,24 @@ STD_RETURN_TYPE IdsRm_Manager::SetAuthToken(const char* token) {
     return E_OK;
 }
 
+STD_RETURN_TYPE IdsRm_Manager::SetLocalSink(const char* path) {
+    const std::string p = path ? std::string(path, strnlen(path, 107)) : "";
+
+    std::lock_guard<std::mutex> lock(m_sink_mutex);
+    m_sink_path = p;
+    if (!m_initialized.load()) return E_OK;  /* thread starts in Init() */
+
+    if (!p.empty() && !m_sink_running.load()) {
+        m_sink_running.store(true);
+        m_sink_thread = std::thread(&IdsRm_Manager::sink_loop, this);
+    } else if (p.empty() && m_sink_running.load()) {
+        m_sink_running.store(false);
+        m_sink_cv.notify_all();
+        /* thread joins in DeInit(); detached stop would race on this */
+    }
+    return E_OK;
+}
+
 /* ───────────────────────── Stats ────────────────────────────────────────── */
 
 IdsRm_StatsType IdsRm_Manager::GetStats() const {
@@ -138,6 +179,21 @@ void IdsRm_Manager::OnQsev(const IdsM_QualifiedSecurityEventType* qsev) {
         return;
     }
 
+    /* Deep-copy: the C struct's context_data pointer dangles after return */
+    IdsM_OwnedQSEv owned;
+    owned.idsm_instance_id     = qsev->idsm_instance_id;
+    owned.external_event_id    = qsev->external_event_id;
+    owned.sensor_instance_id   = qsev->sensor_instance_id;
+    owned.severity             = qsev->severity;
+    owned.count                = qsev->count;
+    owned.has_timestamp        = qsev->has_timestamp;
+    owned.timestamp            = qsev->timestamp;
+    owned.context_data_version = qsev->context_data_version;
+    if (qsev->context_data && qsev->context_data_size > 0) {
+        owned.context_data.assign(qsev->context_data,
+                                  qsev->context_data + qsev->context_data_size);
+    }
+
     {
         std::lock_guard<std::mutex> qlock(m_queue_mutex);
         if (m_event_queue.size() >= IDSRM_DEFAULT_QUEUE_DEPTH) {
@@ -145,21 +201,21 @@ void IdsRm_Manager::OnQsev(const IdsM_QualifiedSecurityEventType* qsev) {
             m_stats.events_dropped++;
             return;
         }
-        /* Deep-copy: the C struct's context_data pointer dangles after return */
-        IdsM_OwnedQSEv owned;
-        owned.idsm_instance_id     = qsev->idsm_instance_id;
-        owned.external_event_id    = qsev->external_event_id;
-        owned.sensor_instance_id   = qsev->sensor_instance_id;
-        owned.severity             = qsev->severity;
-        owned.count                = qsev->count;
-        owned.has_timestamp        = qsev->has_timestamp;
-        owned.timestamp            = qsev->timestamp;
-        owned.context_data_version = qsev->context_data_version;
-        if (qsev->context_data && qsev->context_data_size > 0) {
-            owned.context_data.assign(qsev->context_data,
-                                      qsev->context_data + qsev->context_data_size);
+        m_event_queue.push(owned);
+    }
+
+    /* Tee to the local UDS sink (production APK path). Bounded; on
+       overflow the event is dropped -- the manager APK owns the
+       durable queue on the vehicle. */
+    if (m_sink_running.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> slock(m_sink_mutex);
+        if (m_sink_queue.size() < 512U) {
+            m_sink_queue.push_back(std::move(owned));
+            m_sink_cv.notify_one();
+        } else {
+            std::lock_guard<std::mutex> stlock(m_stats_mutex);
+            m_stats.events_dropped++;
         }
-        m_event_queue.push(std::move(owned));
     }
 
     {
@@ -194,6 +250,23 @@ void IdsRm_Manager::worker_loop() {
         }
 
         for (const auto& qsev : batch) {
+            bool url_empty;
+            {
+                std::lock_guard<std::mutex> lock(m_config_mutex);
+                url_empty = m_soc_url.empty();
+            }
+            if (url_empty) {
+                /* No HTTP target: with a local sink the event is counted
+                   as posted (the sink thread owns delivery); without one
+                   it is a hard failure. */
+                std::lock_guard<std::mutex> slock(m_stats_mutex);
+                if (m_sink_running.load(std::memory_order_relaxed)) {
+                    m_stats.events_posted++;
+                } else {
+                    m_stats.events_failed++;
+                }
+                continue;
+            }
             postWithRetry(qsev);
         }
     }
@@ -212,6 +285,108 @@ void IdsRm_Manager::worker_loop() {
     }
 
     cleanupCurl();
+}
+
+void IdsRm_Manager::sink_loop() {
+    while (true) {
+        IdsM_OwnedQSEv item;
+        {
+            std::unique_lock<std::mutex> lock(m_sink_mutex);
+            m_sink_cv.wait(lock, [this] {
+                return !m_sink_queue.empty() || !m_sink_running.load();
+            });
+            if (m_sink_queue.empty()) break;  /* shutdown + drained */
+            item = std::move(m_sink_queue.front());
+            m_sink_queue.pop_front();
+        }
+
+        if (m_sink_fd < 0) {
+            std::string err;
+            if (!sink_connect(err)) {
+                /* Peer (manager APK) down: drop -- APK owns the durable
+                   queue; native side stays bounded and never blocks.
+                   Shutdown-drain pass skips the backoff sleep. */
+                if (m_sink_running.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                std::lock_guard<std::mutex> slock(m_stats_mutex);
+                m_stats.events_dropped++;
+                continue;
+            }
+        }
+
+        std::string line;
+        buildJsonPayload(item, line);
+        line += '\n';
+
+        size_t off = 0;
+        bool ok = true;
+        while (off < line.size()) {
+            const ssize_t n = ::write(m_sink_fd, line.data() + off,
+                                      line.size() - off);
+            if (n > 0) {
+                off += static_cast<size_t>(n);
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            sink_close();
+            std::lock_guard<std::mutex> slock(m_stats_mutex);
+            m_stats.events_dropped++;
+        }
+    }
+}
+
+bool IdsRm_Manager::sink_connect(std::string& err) {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(m_sink_mutex);
+        path = m_sink_path;
+    }
+    if (path.empty()) return false;
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        err = "socket: " + std::string(std::strerror(errno));
+        return false;
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    /* Android abstract namespace: a leading '@' maps to sun_path[0] = 0,
+     * e.g. --sink @idsm_probe connects to the abstract "idsm_probe". */
+    const bool abstract = (path[0] == '@');
+    const size_t path_len = path.size() - (abstract ? 1u : 0u);
+    if (path_len >= sizeof(addr.sun_path)) {
+        err = "sink path too long";
+        ::close(fd);
+        return false;
+    }
+    if (abstract) {
+        std::memcpy(addr.sun_path + 1, path.c_str() + 1, path_len);
+    } else {
+        std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    }
+
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        err = "connect(" + path + "): " + std::string(std::strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    m_sink_fd = fd;
+    return true;
+}
+
+void IdsRm_Manager::sink_close() {
+    if (m_sink_fd >= 0) {
+        ::close(m_sink_fd);
+        m_sink_fd = -1;
+    }
 }
 
 /* ───────────────────────── HTTP POST with retry ─────────────────────────── */
@@ -425,6 +600,10 @@ STD_RETURN_TYPE IdsRm_Core_SetSocUrl(const char* url) {
 
 STD_RETURN_TYPE IdsRm_Core_SetAuthToken(const char* token) {
     return IdsRm_Manager::Instance().SetAuthToken(token);
+}
+
+STD_RETURN_TYPE IdsRm_Core_SetLocalSink(const char* path) {
+    return IdsRm_Manager::Instance().SetLocalSink(path);
 }
 
 IdsRm_StatsType IdsRm_Core_GetStats(void) {

@@ -1,0 +1,2 @@
+# 规则热更新通知属性,允许 idsm_manager_app 写入(property_service 校验)
+idsm.reload u:object_r:idsm_reload_prop:s0 exact string

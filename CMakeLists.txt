@@ -130,7 +130,7 @@ add_executable(test_idsm tests/test_idsm.cpp)
 target_link_libraries(test_idsm PRIVATE idsm_core GTest::gtest_main)
 target_compile_options(test_idsm PRIVATE -Wall -Wextra)
 
-add_executable(test_idsrm tests/test_idsrm.cpp)
+add_executable(test_idsrm tests/test_idsrm.cpp tests/test_idsrm_sink.cpp)
 target_link_libraries(test_idsrm PRIVATE idsrm_core GTest::gtest_main)
 target_compile_options(test_idsrm PRIVATE -Wall -Wextra)
 

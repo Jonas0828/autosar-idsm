@@ -1,0 +1,24 @@
+# host_probe 域(集成模板,挂到 BOARD_SEPOLICY_DIRS)
+type host_probe, domain;
+type host_probe_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(host_probe)
+
+# /proc 轮询 + netlink exec 监听
+r_dir_file(host_probe, proc)
+allow host_probe self:capability { net_admin dac_read_search };
+allow host_probe self:netlink_connector_socket { create bind read write };
+
+# 内核模块可见性(insmod 检测需要读 /proc/modules、/sys/module)
+allow host_probe proc_modules:file r_file_perms;
+allow host_probe sysfs:dir r_dir_perms;
+
+# 上报: connect 到 IdsmManager 的 abstract UDS(对端 socket 带 APK 域标签)
+unix_stream_connect(host_probe, idsm_manager_app)
+
+# 读 APK device-protected 规则目录(current 软链目标)
+allow host_probe idsm_manager_app_data_file:dir r_dir_perms;
+allow host_probe idsm_manager_app_data_file:file r_file_perms;
+
+# 自检日志;桌面调试期可放开,量产建议只留 vendor 日志缓冲
+allow host_probe kmsg_device:chr_file w_file_perms;

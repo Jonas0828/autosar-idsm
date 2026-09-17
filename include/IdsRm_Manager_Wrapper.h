@@ -16,6 +16,7 @@ STD_RETURN_TYPE IdsRm_Core_Disable(void);
 boolean         IdsRm_Core_IsEnabled(void);
 STD_RETURN_TYPE IdsRm_Core_SetSocUrl(const char* url);
 STD_RETURN_TYPE IdsRm_Core_SetAuthToken(const char* token);
+STD_RETURN_TYPE IdsRm_Core_SetLocalSink(const char* path);
 IdsRm_StatsType IdsRm_Core_GetStats(void);
 void            IdsRm_Core_ResetStats(void);
 

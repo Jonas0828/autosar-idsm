@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  IdsmManager -- 车规 IDSM 管理 APK(系统签名 + persistent)。
+  职责: 接收 host_probe / eth_probe 经 UDS(abstract @idsm_probe)上报的
+  NDJSON 告警,持久排队后走 MQTT/TLS 上云;接收云端签名的规则包并分发给探针。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:name=".IdsmApp"
+        android:label="IDSM Manager"
+        android:persistent="true"
+        android:directBootAware="true">
+
+        <service
+            android:name=".IdsmService"
+            android:directBootAware="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:directBootAware="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 写规则目录 /data/vendor/idsm(由 sepolicy 授予,见 android/vendor/) -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+</manifest>

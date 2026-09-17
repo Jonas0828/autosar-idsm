@@ -1,0 +1,17 @@
+# eth_probe 域(集成模板)
+type eth_probe, domain;
+type eth_probe_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(eth_probe)
+
+# AF_PACKET 抓包
+allow eth_probe self:capability { net_raw net_admin };
+allow eth_probe self:packet_socket { create bind read write };
+allow eth_probe self:netlink_route_socket { create bind read write };
+
+# 规则文件 + 上报 UDS,约定同 host_probe
+allow eth_probe idsm_manager_app_data_file:dir r_dir_perms;
+allow eth_probe idsm_manager_app_data_file:file r_file_perms;
+unix_stream_connect(eth_probe, idsm_manager_app)
+
+allow eth_probe kmsg_device:chr_file w_file_perms;

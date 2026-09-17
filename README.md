@@ -273,6 +273,12 @@ cmake -B build-android \
 cmake --build build-android --target host_probe
 ```
 
+On-vehicle the probe runs as a root init service and reports over the UDS
+sink instead of HTTP: see [`android/`](android/) for the manager APK,
+init `.rc` and sepolicy templates, and
+[docs/android-production.md](docs/android-production.md) for the
+probes → APK → MQTT/TLS → cloud architecture.
+
 **Regulatory mapping** (GB 44495-2024 / R155): malicious software
 protection (1), privilege-escalation detection (2), DoS via resource
 exhaustion (3/9), remote control / reverse shell (4), file & firmware
@@ -400,8 +406,30 @@ This project includes a ready-to-deploy cloud SOC stack (`tools/soc_dashboard_cl
 | `IdsRm_IsEnabled()` | Returns `true` if initialized AND enabled |
 | `IdsRm_SetSocUrl(url)` | Update SOC URL at runtime (thread-safe, takes effect on next POST) |
 | `IdsRm_SetAuthToken(token)` | Update bearer token at runtime (pass `""` to remove) |
+| `IdsRm_SetLocalSink(path)` | Tee qualified events as NDJSON lines to a unix-domain socket (e.g. the IDSM manager APK); pass `""`/NULL to disable. `@name` selects an Android abstract socket |
 | `IdsRm_GetStats()` | Get snapshot: received, dropped, posted, failed, retries |
 | `IdsRm_ResetStats()` | Reset all counters to zero |
+
+### Local UDS Sink — Vehicle Path to the Manager APK
+
+For in-vehicle deployment the probes do not talk to the cloud directly.
+`IdsRm_SetLocalSink()` (or the probe `--sink PATH` flag) tees every
+qualified event as one NDJSON line to an AF_UNIX socket:
+
+```
+host_probe/eth_probe --sink @idsm_probe
+    │  {"ids_message":"...","event_id":32805,"severity":"MEDIUM",...}
+    ▼
+IdsmManager APK (system app) → SQLite queue → MQTT/TLS → cloud
+```
+
+Delivery is fire-and-forget with bounded queueing (512 events) and graceful
+drain on shutdown; the APK owns persistence, so the native side stays
+dependency-free (no TLS/MQTT libraries). With `--sink` and no `--soc`, the
+HTTP path is compiled out at runtime. The Android side (manager APK, init
+`.rc`, sepolicy, MQTT/rule-update flow) lives in [`android/`](android/) —
+see [docs/android-production.md](docs/android-production.md) for the
+full production architecture and the GB 44495-2024 mapping.
 
 ### JSON Payload Format
 

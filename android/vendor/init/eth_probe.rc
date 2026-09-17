@@ -1,0 +1,15 @@
+# eth_probe 车规拉起配置(集成模板)。网卡名按车型项目替换。
+# 规则路径约定同 host_probe.rc(APK device-protected 目录 + current 软链)。
+service idsm_eth_probe /vendor/bin/eth_probe -i eth0 \
+        --rules /data/data/com.idsm.manager/files/rules/current/eth.rules \
+        --sink @idsm_probe
+    class core
+    user root
+    group root
+    seclabel u:r:eth_probe:s0
+    restart
+    oom_score_adjust -800
+    memcg.limit_in_bytes 64M
+
+on property:idsm.reload=eth
+    restart idsm_eth_probe

@@ -1,0 +1,28 @@
+# host_probe 车规拉起配置(集成模板)
+# 放到 vendor 分区的 init rc 目录(如 vendor/etc/init/),
+# 由 OEM 构建系统随镜像打包。探针二进制 host_probe 放 /vendor/bin/。
+
+# host_probe 车规拉起配置(集成模板)
+# 放到 vendor 分区的 init rc 目录(如 vendor/etc/init/),
+# 由 OEM 构建系统随镜像打包。探针二进制 host_probe 放 /vendor/bin/。
+#
+# 基线路径: 出厂默认在 /vendor/etc/idsm/v0/(只读,随镜像 OTA);
+# 热更新规则由 IdsmManager APK 写入其 device-protected 目录并维护
+# current 软链,探针重启后经 sepolicy 读取(见 android/vendor/sepolicy/)。
+
+service idsm_host_probe /vendor/bin/host_probe \
+        --baseline-exec /data/data/com.idsm.manager/files/rules/current/exec.txt \
+        --baseline-files /data/data/com.idsm.manager/files/rules/current/files.txt \
+        --baseline-mods /data/data/com.idsm.manager/files/rules/current/mods.txt \
+        --sink @idsm_probe
+    class core
+    user root
+    group root
+    seclabel u:r:host_probe:s0
+    # 崩溃/被杀后由 init 拉起;内存兜底防探针自身拖垮系统
+    restart
+    oom_score_adjust -800
+    memcg.limit_in_bytes 64M
+# 规则热更新:RuleManager 验签切换后设置该属性,init 重启探针读新基线
+on property:idsm.reload=host
+    restart idsm_host_probe

@@ -1,0 +1,3 @@
+# 平台签名 + persistent 的 IdsmManager 映射进独立域和数据类型
+# (seinfo=platform 对应 platform 签名证书)
+user=_app isPrivApp=true seinfo=platform domain=idsm_manager_app type=idsm_manager_app_data_file levelFrom=user

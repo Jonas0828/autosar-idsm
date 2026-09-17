@@ -9,6 +9,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <deque>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -33,6 +34,15 @@ public:
     /* Runtime config updates (thread-safe) */
     STD_RETURN_TYPE SetSocUrl(const char* url);
     STD_RETURN_TYPE SetAuthToken(const char* token);
+
+    /* Local UDS sink (production vehicle path): every qualified event is
+       additionally forwarded as one NDJSON line (same JSON schema as the
+       HTTP body) to a unix-domain STREAM socket, normally served by the
+       IDSM manager APK on Android. Pass an empty/null path to disable.
+       The sink is fire-and-forget: when the peer is down, events are
+       dropped (the APK owns the durable queue). When soc_url is empty
+       AND a sink is configured, the HTTP path is skipped entirely. */
+    STD_RETURN_TYPE SetLocalSink(const char* path);
 
     /* Stats */
     IdsRm_StatsType GetStats() const;
@@ -73,6 +83,19 @@ private:
 
     /* libcurl handle: created once in worker thread, reused for keep-alive */
     CURL* m_curl_handle{nullptr};
+
+    /* Local UDS sink -- own thread + bounded queue; never blocks OnQsev */
+    std::thread                m_sink_thread;
+    std::atomic<bool>          m_sink_running{false};
+    std::mutex                 m_sink_mutex;    /* path + queue guard */
+    std::condition_variable    m_sink_cv;
+    std::deque<IdsM_OwnedQSEv> m_sink_queue;
+    std::string                m_sink_path;
+    int                        m_sink_fd{-1};
+
+    void sink_loop();
+    bool sink_connect(std::string& err);
+    void sink_close();
 
     /* Worker */
     void worker_loop();

@@ -32,6 +32,11 @@ STD_RETURN_TYPE IdsRm_SetAuthToken(const char* token) {
     return IdsRm_Core_SetAuthToken(token);
 }
 
+STD_RETURN_TYPE IdsRm_SetLocalSink(const char* path) {
+    /* NULL means "disable", same as "" -- the C++ side treats both the same */
+    return IdsRm_Core_SetLocalSink(path ? path : "");
+}
+
 IdsRm_StatsType IdsRm_GetStats(void) {
     return IdsRm_Core_GetStats();
 }

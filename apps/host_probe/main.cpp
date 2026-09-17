@@ -60,6 +60,8 @@ void on_signal(int) {
 struct Args {
     std::string events;         /* offline replay instead of live capture */
     std::string soc_url = "http://localhost:8080/api/idsm-violations";
+    std::string sink;           /* UDS path to the IDSM manager APK (vehicle) */
+    bool        soc_given = false;
     std::string baseline_exec;
     std::string baseline_files;
     std::string baseline_mods;
@@ -85,7 +87,8 @@ Args parse_args(int argc, char** argv) {
             return argv[++i];
         };
         if (s == "--events") a.events = next("--events");
-        else if (s == "--soc") a.soc_url = next("--soc");
+        else if (s == "--soc") { a.soc_url = next("--soc"); a.soc_given = true; }
+        else if (s == "--sink") a.sink = next("--sink");
         else if (s == "--baseline-exec") a.baseline_exec = next("--baseline-exec");
         else if (s == "--baseline-files") a.baseline_files = next("--baseline-files");
         else if (s == "--baseline-mods") a.baseline_mods = next("--baseline-mods");
@@ -122,6 +125,10 @@ void print_usage(const char* prog) {
         "  --scan-ms MS           /proc poll interval (default 1000)\n"
         "  --no-netlink           force the /proc poller (no PROC_CONNECTOR)\n"
         "  --soc URL              SOC endpoint (default http://localhost:8080/api/idsm-violations)\n"
+        "                         pass an empty URL with --sink to disable HTTP\n"
+        "  --sink PATH            local UDS sink (NDJSON) to the IDSM manager APK;\n"
+        "                         without --soc this replaces the HTTP path (vehicle)\n"
+        "                         '@name' selects an Android abstract socket\n"
         "  --fork-rate N          fork-flood threshold, execs/window (default 200)\n"
         "  --zombie-max N         zombie-storm threshold (default 100)\n"
         "  --cpu-ppm N            CPU exhaustion threshold, permille (default 900)\n"
@@ -167,7 +174,7 @@ void report_alert(const hostprobe::HostAlert& a) {
 } /* namespace */
 
 int main(int argc, char** argv) {
-    const Args args = parse_args(argc, argv);
+    Args args = parse_args(argc, argv);
     if (args.help) {
         print_usage(argv[0]);
         return 0;
@@ -261,6 +268,10 @@ int main(int argc, char** argv) {
     }
     std::cout << "[IDSM] Initialized | 10 SEvs ext 0x8021-0x802A (one per detector type)\n";
 
+    /* Vehicle mode: --sink without --soc means the HTTP path is off and
+       every event goes to the local UDS sink (manager APK). */
+    if (!args.sink.empty() && !args.soc_given) args.soc_url.clear();
+
     IdsRm_ConfigType idsrm_cfg{};
     std::strncpy(idsrm_cfg.soc_url, args.soc_url.c_str(), IDSRM_MAX_URL_LEN - 1);
     idsrm_cfg.auth_token[0] = '\0';
@@ -272,7 +283,10 @@ int main(int argc, char** argv) {
         IdsM_DeInit();
         return 1;
     }
-    std::cout << "[IDSRM] Initialized | Forwarding to " << idsrm_cfg.soc_url << "\n";
+    if (!args.sink.empty()) IdsRm_SetLocalSink(args.sink.c_str());
+    std::cout << "[IDSRM] Initialized | Forwarding to "
+              << (idsrm_cfg.soc_url[0] ? idsrm_cfg.soc_url : std::string("(local sink ") + args.sink + ")")
+              << "\n";
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

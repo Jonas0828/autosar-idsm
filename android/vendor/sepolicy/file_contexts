@@ -1,0 +1,10 @@
+# 探针二进制
+/vendor/bin/host_probe        u:object_r:host_probe_exec:s0
+/vendor/bin/eth_probe         u:object_r:eth_probe_exec:s0
+
+# APK 本体(预装到 /system_ext 或 /product,按 OEM 分区调整)
+/system_ext/app/IdsmManager/IdsmManager.apk    u:object_r:system_file:s0
+
+# 规则数据目录:APK 的 device-protected 存储
+# (/data/user_de/0/com.idsm.manager/files)由 seapp_contexts 自动打
+# idsm_manager_app_data_file 标签,无需 file_contexts 条目。

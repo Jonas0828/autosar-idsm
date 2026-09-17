@@ -31,6 +31,15 @@ STD_RETURN_TYPE IdsRm_SetSocUrl(const char* url);
    Pass "" to remove the Authorization header. */
 STD_RETURN_TYPE IdsRm_SetAuthToken(const char* token);
 
+/* Local UDS sink for the production vehicle path: forward every event as
+   one NDJSON line (same JSON schema as the HTTP body) to a unix-domain
+   STREAM socket served by the IDSM manager APK. Fire-and-forget: events
+   are dropped while the peer is down (the APK owns the durable queue).
+   If soc_url is empty and a sink is configured, the HTTP path is skipped.
+   Callable before IdsRm_Init() (applied at init) or at runtime.
+   Pass "" or NULL to disable. */
+STD_RETURN_TYPE IdsRm_SetLocalSink(const char* path);
+
 /* Get a snapshot of operational statistics. */
 IdsRm_StatsType IdsRm_GetStats(void);
 
