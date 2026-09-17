@@ -1,0 +1,25 @@
+# can_probe CAN ID whitelist example.
+# Format: hex_id [min_interval_ms]
+#   - one entry per line; '#' starts a comment
+#   - listing an ID makes it "known": frames with any other ID raise
+#     DT_UNKNOWN_ID (0x8011); the diagnostics range 0x7DF / 0x7E0-0x7EF
+#     is standardized and always treated as known
+#   - the optional min_interval_ms enables cycle-time anomaly detection
+#     (DT_CYCLE_ANOMALY 0x801A): the same ID reappearing faster than
+#     its nominal cycle raises an alert
+#
+# Typical powertrain bus (example values -- replace with your DBC):
+
+# engine controller, 100 ms periodic
+100         90
+# vehicle speed, 20 ms periodic
+123         18
+# instrument cluster, 100 ms periodic
+320         95
+# gateway heartbeat, 1000 ms periodic
+400         900
+
+# diagnostics (standardized, optional to list)
+7DF
+7E0
+7E8

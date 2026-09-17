@@ -182,3 +182,41 @@ Grafana 10 秒内自动刷新归零。
 | 11 | 0x800D | DNS | 0xB001=非法域名 / 0xB000+qtype |
 | 12 | 0x800E | ARP_SPOOF | 1=绑定突变 / 2=无偿洪泛 |
 | 100 | 0x8010 | SURICATA（eve_bridge） | signature_id |
+
+### CAN 探针 (can_probe)
+
+| type | SEv ext ID | 名称 | aux 含义 |
+|---|---|---|---|
+| 1 | 0x8011 | CAN_UNKNOWN_ID | 0（白名单外的帧 ID） |
+| 2 | 0x8012 | CAN_ID_FLOOD | 实测 fps |
+| 3 | 0x8013 | CAN_BUS_FLOOD | 实测 fps |
+| 4 | 0x8014 | CAN_ERROR_BURST | 窗口内错误帧数 |
+| 5 | 0x8015 | CAN_DLC_ANOMALY | 1=classic DLC>8 / 2=FD len>64 |
+| 6 | 0x8016 | CAN_REMOTE_FRAME | 0 |
+| 7 | 0x8017 | CAN_UDS_SEC_ACCESS | 1=SEED_FLOOD / 2=KEY_GUESS |
+| 8 | 0x8018 | CAN_UDS_SVC_SCAN | 不同 SID 数 |
+| 9 | 0x8019 | CAN_DIAG_FLOOD | 实测 fps |
+| 10 | 0x801A | CAN_CYCLE_ANOMALY | 实测间隔 ms |
+
+CAN 上下文为 16 字节布局 v1：`detector_type(1) | flags(1) | can_id(4) | reserved(2) |
+count(4) | aux(4)`，大端。flags: E=扩展帧 R=远程帧 F=FD X=错误帧。
+
+**实时攻击测试**（需要 can-utils，无真实 CAN 卡时用虚拟总线）：
+
+```bash
+sudo modprobe vcan && sudo ip link add dev can0 type vcan && sudo ip link set can0 up
+sudo ./build/can_probe -i can0 --ids apps/can_probe/whitelist/example_ids.txt \
+    --soc http://localhost:9000/api/idsm-violations
+# 另一个终端发攻击帧：
+cansend can0 321#DEADBEEF        # 未知 ID 注入 -> 0x8011
+for i in $(seq 6); do cansend can0 7E0#2701; done   # UDS SecurityAccess 爆破 -> 0x8017
+for i in $(seq 60); do cansend can0 7DF#3E00; done  # 诊断洪泛 -> 0x8019
+for i in $(seq 120); do cansend can0 123#01020304; done  # 单 ID 洪泛 -> 0x8012
+```
+
+**离线回放**（pcap 需为 LINKTYPE_CAN_SOCKETCAN=227，可用 `candump -L` 或 scapy 生成）：
+
+```bash
+./build/can_probe --pcap capture.pcap --ids apps/can_probe/whitelist/example_ids.txt \
+    --soc http://localhost:9000/api/idsm-violations
+```

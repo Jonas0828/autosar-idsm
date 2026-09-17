@@ -37,18 +37,58 @@ DETECTOR_NAMES = {
     5: "DOIP", 6: "SOME_IP", 7: "REASSEMBLY", 8: "CROSS_BORDER",
     9: "TLS", 10: "HTTP", 11: "DNS", 12: "ARP_SPOOF", 100: "SURICATA",
 }
-PROTO_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6"}
+# can_probe detector_type -> name (apps/can_probe/alert.h); the 16-byte
+# CAN context layout is dispatched by payload length in decode_context
+CAN_DETECTOR_NAMES = {
+    1: "CAN_UNKNOWN_ID", 2: "CAN_ID_FLOOD", 3: "CAN_BUS_FLOOD",
+    4: "CAN_ERROR_BURST", 5: "CAN_DLC_ANOMALY", 6: "CAN_REMOTE_FRAME",
+    7: "CAN_UDS_SEC_ACCESS", 8: "CAN_UDS_SVC_SCAN", 9: "CAN_DIAG_FLOOD",
+    10: "CAN_CYCLE_ANOMALY",
+}
+CAN_FLAG_NAMES = ((0x01, "E"), (0x02, "R"), (0x04, "F"), (0x08, "X"))
 
 
-def decode_context(payload_hex: str) -> str:
-    """Decode the 46-byte eth_probe/eve_bridge context layout v1 into a
+def _can_aux_str(det_type: int, aux: int) -> str:
+    """aux semantics per can_probe detector type."""
+    if det_type in (2, 3, 9):   # floods: observed fps in window
+        return f"{aux}fps"
+    if det_type == 5:           # DLC anomaly
+        return {1: "DLC>8(classic)", 2: "LEN>64(FD)"}.get(aux, f"0x{aux:X}")
+    if det_type == 7:           # UDS SecurityAccess
+        return {1: "SEED_FLOOD", 2: "KEY_GUESS"}.get(aux, f"0x{aux:X}")
+    if det_type == 10:          # cycle anomaly: observed interval ms
+        return f"{aux}ms"
+    return f"0x{aux:X}"
+
+
+def decode_can_context(payload_hex: str) -> str:
+    """Decode the 16-byte can_probe context layout v1 into a
     human-readable summary. Returns empty string for other layouts."""
     try:
         raw = bytes.fromhex(payload_hex)
     except ValueError:
         return ""
-    if len(raw) != 46:
+    if len(raw) != 16:
         return ""
+    det_type, flags = raw[0], raw[1]
+    can_id, _res, count, aux = struct.unpack(">IHII", raw[2:16])
+    det = CAN_DETECTOR_NAMES.get(det_type, f"CAN_TYPE_{det_type}")
+    flag_s = "".join(n for bit, n in CAN_FLAG_NAMES if flags & bit) or "-"
+    return (f"{det} id=0x{can_id:03X}[{flag_s}]"
+            f" aux={_can_aux_str(det_type, aux)} x{count}")
+PROTO_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6"}
+
+
+def decode_context(payload_hex: str) -> str:
+    """Decode a probe context layout v1 (46-byte eth_probe/eve_bridge or
+    16-byte can_probe) into a human-readable summary. Returns empty
+    string for other layouts."""
+    try:
+        raw = bytes.fromhex(payload_hex)
+    except ValueError:
+        return ""
+    if len(raw) != 46:
+        return decode_can_context(payload_hex)
     (det_type, proto, sport, dport) = struct.unpack(">BBHH", raw[:6])
     src = raw[6:22]
     dst = raw[22:38]

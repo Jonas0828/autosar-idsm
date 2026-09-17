@@ -106,6 +106,13 @@ autosar-idsm-toolkit/
 │   │   ├── capture.h/.cpp         # AF_PACKET live capture + pcap replay
 │   │   ├── main.cpp               # probe entry: alerts → IdsM_ReportSecurityEvent()
 │   │   └── rules/                 # example.rules + trimmed chnroutes.txt
+│   ├── can_probe/                 # Lightweight CAN IDS probe (SocketCAN, Linux)
+│   │   ├── frame.h/.cpp          # SocketCAN record parser (classic 16B / CAN-FD 72B)
+│   │   ├── detectors.h/.cpp      # unknown-ID / flood / error / DLC / UDS detectors
+│   │   ├── pipeline.h/.cpp       # detection pipeline wiring everything together
+│   │   ├── capture.h/.cpp        # CAN_RAW live capture + SocketCAN pcap replay
+│   │   ├── main.cpp              # probe entry: alerts -> IdsM_ReportSecurityEvent()
+│   │   └── whitelist/            # example CAN ID whitelist (hex_id [min_interval_ms])
 │   └── eve_bridge/                # Suricata EVE → IDSM bridge (rail B)
 │       ├── eve.h/.cpp             # minimal EVE JSON alert parser
 │       └── main.cpp               # unix_stream listener → IdsM_ReportSecurityEvent()
@@ -113,6 +120,7 @@ autosar-idsm-toolkit/
 │   ├── test_idsm.cpp              # IDSM unit tests (Google Test)
 │   ├── test_idsrm.cpp             # IDSRM unit + integration tests
 │   ├── eth_probe/                 # 88 eth_probe + eve_bridge tests
+│   ├── can_probe/                 # 33 CAN probe tests
 │   └── mock_soc_server.py         # Python mock SOC endpoint for local testing
 ├── tools/
 │   └── soc_dashboard_cloud/
@@ -129,8 +137,8 @@ autosar-idsm-toolkit/
 ## Ethernet IDS Probe (eth_probe) — Rail A
 
 Lightweight self-contained Ethernet IDS probe (no Suricata/libpcap dependency),
-built for embedded targets. Alerts enter the IDSM filter chain as a single SEv
-(ext `0x8003`, context layout v1) and flow through IDSRM to the SOC.
+built for embedded targets. Alerts enter the IDSM filter chain as one SEv per detector type
+(ext `0x8003`-`0x800E`, context layout v1) and flow through IDSRM to the SOC.
 
 **Detectors** (detector_type in context data):
 
@@ -160,9 +168,48 @@ sudo ./build/eth_probe -i eth0 --rules apps/eth_probe/rules/example.rules \
 **Regulatory mapping** (GB 44495-2024 / GB 44496-2024): port scan (1), DoS (2),
 malformed data (3/5/6), known-attack signatures (4), unauthorized diagnostic
 access (4/5), network spoofing (12), data-export monitoring (8), event
-recording & reporting (IDSM/IDSRM core). CAN-bus detection is out of scope
-(separate CAN sensor over the same IDSM API).
+recording & reporting (IDSM/IDSRM core). CAN-bus detection is covered by
+`can_probe` below over the same IDSM API.
 
+## CAN IDS Probe (can_probe)
+
+Lightweight CAN/CAN-FD IDS probe over SocketCAN (no libpcap dependency), covering
+the GB 44495-2024 CAN-bus detection requirements. Alerts enter the IDSM filter
+chain as one SEv per detector type (ext `0x8011`-`0x801A`, CAN context layout v1,
+16 bytes) and flow through IDSRM to the SOC.
+
+**Detectors** (detector_type in context data):
+
+| # | Detector | SEv ext | Notes |
+|:--|:---|:---|:---|
+| 1 | Unknown ID | 0x8011 | frame ID not in the vehicle whitelist (message injection) |
+| 2 | ID flood | 0x8012 | per-ID frames/s in tumbling window (targeted DoS) |
+| 3 | Bus flood | 0x8013 | bus-wide frames/s (DoS on arbitration) |
+| 4 | Error burst | 0x8014 | error frames in window (bus-off / fault injection) |
+| 5 | DLC anomaly | 0x8015 | classic DLC > 8, CAN-FD len > 64 (malformed frame) |
+| 6 | Remote frame | 0x8016 | RTR frame on an RTR-free automotive bus |
+| 7 | UDS SecurityAccess | 0x8017 | 0x27 requestSeed / sendKey brute force per tester |
+| 8 | UDS service scan | 0x8018 | many distinct SIDs from one tester |
+| 9 | Diagnostic flood | 0x8019 | request flood on 0x7DF / 0x7E0-0x7E7 |
+| 10 | Cycle anomaly | 0x801A | periodic message faster than its min interval |
+
+**Whitelist** (`--ids FILE`): one `hex_id [min_interval_ms]` per line (`#` comments).
+Loading a whitelist enables detectors 1 and 10; the standardized diagnostics
+range 0x7DF / 0x7E0-0x7EF is always treated as known. See
+`apps/can_probe/whitelist/example_ids.txt`.
+
+**Run** (Linux, live capture requires root and a configured SocketCAN interface):
+
+```bash
+sudo ip link set can0 up type can bitrate 500000        # if needed
+sudo ./build/can_probe -i can0 --ids apps/can_probe/whitelist/example_ids.txt
+./build/can_probe --pcap capture.pcap --ids ...          # offline replay
+```
+
+**Regulatory mapping** (GB 44495-2024 / R155): unauthorized message injection (1),
+DoS via flooding (2/3/9), bus-off / fault-injection indicators (4), malformed
+frames (5/6), unauthorized diagnostic access (7/8/9), periodic-message integrity
+(10), event recording & reporting (IDSM/IDSRM core).
 ## Suricata Bridge (eve_bridge) — Rail B
 
 Full-capability detection on HIL/gateway hosts: run stock Suricata (official

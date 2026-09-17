@@ -77,8 +77,24 @@ if(UNIX AND NOT APPLE)
     target_include_directories(eth_probe_lib PUBLIC apps/eth_probe)
     target_link_libraries(eth_probe_lib PUBLIC idsm_core idsrm_core)
     target_compile_options(eth_probe_lib PRIVATE -Wall -Wextra -Wpedantic)
+
+    # CAN IDS probe (Linux-only: SocketCAN capture)
+    add_library(can_probe_lib STATIC
+        apps/can_probe/frame.cpp
+        apps/can_probe/alert.cpp
+        apps/can_probe/detectors.cpp
+        apps/can_probe/pipeline.cpp
+        apps/can_probe/capture.cpp
+    )
+    target_include_directories(can_probe_lib PUBLIC apps/can_probe)
+    target_link_libraries(can_probe_lib PUBLIC idsm_core idsrm_core)
+    target_compile_options(can_probe_lib PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_executable(can_probe apps/can_probe/main.cpp)
+    target_link_libraries(can_probe PRIVATE can_probe_lib)
 else()
-    message(STATUS "Skipping eth_probe: requires Linux (AF_PACKET)")
+    message(STATUS "Skipping eth_probe/can_probe: requires Linux (AF_PACKET/SocketCAN)")
+
 endif()
 
 # Tests
@@ -123,6 +139,18 @@ if(TARGET eth_probe_lib)
     target_compile_options(test_eth_probe PRIVATE -Wall -Wextra)
     gtest_discover_tests(test_eth_probe)
 endif()
+
+if(TARGET can_probe_lib)
+    add_executable(test_can_probe
+        tests/can_probe/test_frame.cpp
+        tests/can_probe/test_detectors.cpp
+        tests/can_probe/test_pipeline.cpp
+    )
+    target_link_libraries(test_can_probe PRIVATE can_probe_lib GTest::gtest_main)
+    target_compile_options(test_can_probe PRIVATE -Wall -Wextra)
+    gtest_discover_tests(test_can_probe)
+endif()
+
 
 # Install targets
 install(TARGETS idsm_core idsrm_core idsm_cli
