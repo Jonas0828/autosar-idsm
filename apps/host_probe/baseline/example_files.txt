@@ -1,0 +1,19 @@
+# host_probe file integrity baseline -- sha256sum output format:
+#   <sha256hex><space><space><path>
+# Paths may not contain spaces. Any listed file whose digest changes
+# alerts as DT_FILE_MOD; a vanished file alerts with HF_MISSING.
+# The listed paths also form the "known path" set for DT_NEW_SETUID:
+# a setuid-root file whose path is NOT listed here alerts as new.
+#
+# Generate from a trusted system, e.g.:
+#   sha256sum /etc/passwd /etc/shadow /etc/group /etc/ld.so.preload \
+#             /etc/ssh/sshd_config /etc/crontab > files.txt
+#
+# Android targets typically monitor (hashes must be generated on-device):
+#   /system/build.prop /vendor/build.prop /init.rc /init.environ.rc
+#   /system/bin/app_process64 /system/framework/boot.art
+#
+# Example entries (replace with digests of YOUR trusted files):
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /etc/passwd
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /etc/shadow
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /etc/ld.so.preload

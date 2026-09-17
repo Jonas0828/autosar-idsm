@@ -113,6 +113,15 @@ autosar-idsm-toolkit/
 │   │   ├── capture.h/.cpp        # CAN_RAW live capture + SocketCAN pcap replay
 │   │   ├── main.cpp              # probe entry: alerts -> IdsM_ReportSecurityEvent()
 │   │   └── whitelist/            # example CAN ID whitelist (hex_id [min_interval_ms])
+│   ├── host_probe/                # Lightweight host IDS probe (Linux + Android)
+│   │   ├── event.h/.cpp           # host event model + replay-log parser
+│   │   ├── sha256.h/.cpp          # self-contained SHA-256 (file integrity)
+│   │   ├── baseline.h/.cpp        # exec / file / module baselines
+│   │   ├── detectors.h/.cpp       # unknown-exec / priv-esc / fork-flood / rev-shell / ...
+│   │   ├── pipeline.h/.cpp        # detection pipeline wiring everything together
+│   │   ├── capture.h/.cpp         # PROC_CONNECTOR netlink + /proc poller + replay
+│   │   ├── main.cpp               # probe entry: alerts -> IdsM_ReportSecurityEvent()
+│   │   └── baseline/              # example exec/file/module baselines
 │   └── eve_bridge/                # Suricata EVE → IDSM bridge (rail B)
 │       ├── eve.h/.cpp             # minimal EVE JSON alert parser
 │       └── main.cpp               # unix_stream listener → IdsM_ReportSecurityEvent()
@@ -121,6 +130,7 @@ autosar-idsm-toolkit/
 │   ├── test_idsrm.cpp             # IDSRM unit + integration tests
 │   ├── eth_probe/                 # 88 eth_probe + eve_bridge tests
 │   ├── can_probe/                 # 33 CAN probe tests
+│   ├── host_probe/                # 36 host probe tests
 │   └── mock_soc_server.py         # Python mock SOC endpoint for local testing
 ├── tools/
 │   └── soc_dashboard_cloud/
@@ -210,6 +220,65 @@ sudo ./build/can_probe -i can0 --ids apps/can_probe/whitelist/example_ids.txt
 DoS via flooding (2/3/9), bus-off / fault-injection indicators (4), malformed
 frames (5/6), unauthorized diagnostic access (7/8/9), periodic-message integrity
 (10), event recording & reporting (IDSM/IDSRM core).
+## Host IDS Probe (host_probe) — Rail A
+
+Lightweight host-based IDS probe for Linux and Android (no libpcap/libaudit
+dependency), covering the GB 44495-2024 host-side detection requirements.
+Alerts enter the IDSM filter chain as one SEv per detector type
+(ext `0x8021`-`0x802A`, host context layout v1, 32 bytes) and flow through
+IDSRM to the SOC.
+
+**Detectors** (detector_type in context data):
+
+| # | Detector | SEv ext | Notes |
+|:--|:---|:---|:---|
+| 1 | Unknown exec | 0x8021 | exec of binary not in the allowlist (malware) |
+| 2 | Privilege escalation | 0x8022 | setuid-root exec by non-root (flags: setuid/setgid) |
+| 3 | Fork flood | 0x8023 | exec rate in tumbling window (fork-bomb DoS) |
+| 4 | Reverse shell | 0x8024 | shell spawned by a network-facing daemon (adbd/sshd/netd/...) |
+| 5 | File integrity | 0x8025 | monitored file sha256 mismatch / vanished |
+| 6 | New setuid file | 0x8026 | setuid-root file outside the file baseline |
+| 7 | Kernel module | 0x8027 | module load outside baseline, LKM/rootkit indicator (Linux) |
+| 8 | Zombie storm | 0x8028 | zombie processes over threshold in window |
+| 9 | Resource exhaustion | 0x8029 | per-process CPU permille / RSS over threshold |
+| 10 | Root shell | 0x802A | uid-0 shell session (aux: TTY vs ssh/adb) |
+
+**Event sources**: netlink `PROC_CONNECTOR` (CN_PROC exec events, real time,
+root) with automatic `/proc` polling fallback (works on Android without any
+kernel config); both feed one detection pipeline. Offline replay via
+`--events` for testing.
+
+**Baselines** (`apps/host_probe/baseline/` examples):
+- `--baseline-exec`: one entry per line, exact path or basename
+- `--baseline-files`: `sha256sum` output format (also seeds the known-path
+  set for detector 6)
+- `--baseline-mods`: one module name per line
+
+**Run** (Linux; netlink exec events require root, the poller does not):
+
+```bash
+sudo ./build/host_probe --baseline-exec apps/host_probe/baseline/example_exec.txt \
+    --baseline-files files.txt --baseline-mods mods.txt
+./build/host_probe --no-netlink --scan-ms 1000    # poller-only mode (no root)
+./build/host_probe --events sample.events          # offline replay
+```
+
+**Android** (NDK cross-build; only POSIX APIs + /proc, so bionic suffices):
+
+```bash
+cmake -B build-android \
+    -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+    -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=$HOME/work/deps/googletest-1.14.0
+cmake --build build-android --target host_probe
+```
+
+**Regulatory mapping** (GB 44495-2024 / R155): malicious software
+protection (1), privilege-escalation detection (2), DoS via resource
+exhaustion (3/9), remote control / reverse shell (4), file & firmware
+integrity (5/6), kernel tampering indicators (7), abnormal process
+behavior (8/10), event recording & reporting (IDSM/IDSRM core).
+
 ## Suricata Bridge (eve_bridge) — Rail B
 
 Full-capability detection on HIL/gateway hosts: run stock Suricata (official

@@ -46,6 +46,11 @@ curl http://localhost:3000/api/health    # expect {"database":"ok"}
 INFLUXDB_TOKEN=idsm-admin-token node server.js
 #    (token/org/bucket must match docker-compose.yml)
 
+#    ... or install it as a systemd service so it survives reboots:
+sudo cp idsm-soc-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now idsm-soc-server
+
 # 4. Point the probe at it
 sudo ./build/eth_probe -i eth1 --soc http://localhost:9000/api/idsm-violations \
     --rules apps/eth_probe/rules/example.rules --cidr apps/eth_probe/rules/chnroutes.txt

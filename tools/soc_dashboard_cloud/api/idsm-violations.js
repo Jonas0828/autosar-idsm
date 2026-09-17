@@ -19,6 +19,14 @@ const DETECTOR_NAMES = {
   5: "DOIP", 6: "SOME_IP", 7: "REASSEMBLY", 8: "CROSS_BORDER",
   9: "TLS", 10: "HTTP", 11: "DNS", 12: "ARP_SPOOF", 100: "SURICATA",
 };
+// ext event ID → name for host_probe (apps/host_probe/alert.h, 0x8021-0x802A)
+const HOST_DETECTOR_NAMES = {
+  0x8021: "HOST_UNKNOWN_EXEC", 0x8022: "HOST_PRIV_ESC",
+  0x8023: "HOST_FORK_FLOOD", 0x8024: "HOST_REV_SHELL",
+  0x8025: "HOST_FILE_MOD", 0x8026: "HOST_NEW_SETUID",
+  0x8027: "HOST_KMOD_LOAD", 0x8028: "HOST_ZOMBIE_STORM",
+  0x8029: "HOST_RES_EXHAUST", 0x802a: "HOST_ROOT_SHELL",
+};
 const PROTO_NAMES = { 1: "ICMP", 6: "TCP", 17: "UDP", 58: "ICMPv6" };
 
 function ipStr(b) {
@@ -31,16 +39,22 @@ function ipStr(b) {
   return groups.join(":");
 }
 
-// Decode 46-byte context layout v1 → human summary + structured fields.
+// Decode context layout v1 → human summary + structured fields.
+// Two layouts: 46-byte eth (ext 0x8003) and 32-byte host (ext 0x8021+).
 // Returns null for other layouts (caller stores raw payload only).
-function decodeContext(payloadHex) {
+function decodeContext(payloadHex, eventId) {
   let raw;
   try {
     raw = Buffer.from(payloadHex, "hex");
   } catch {
     return null;
   }
-  if (raw.length !== 46) return null;
+  if (raw.length === 46) return decodeEthContext(raw);
+  if (raw.length === 32) return decodeHostContext(raw, eventId);
+  return null;
+}
+
+function decodeEthContext(raw) {
   const detType = raw[0];
   const proto = raw[1];
   const sport = raw.readUInt16BE(2);
@@ -62,6 +76,33 @@ function decodeContext(payloadHex) {
     aux,
     count,
     summary: `${det} ${protoS} ${srcIp}:${sport} -> ${dstIp}:${dport} aux=0x${aux
+      .toString(16)
+      .toUpperCase()} x${count}`,
+  };
+}
+
+// host context layout v1 (32B, big-endian):
+//   [0] detector_type [1] flags | [2..5] pid | [6..9] uid (file mode)
+//   [10..13] count | [14..17] aux | [18..29] name[12]
+function decodeHostContext(raw, eventId) {
+  const detType = raw[0];
+  const flags = raw[1];
+  const pid = raw.readUInt32BE(2);
+  const uid = raw.readUInt32BE(6);
+  const count = raw.readUInt32BE(10);
+  const aux = raw.readUInt32BE(14);
+  const proc = raw.slice(18, 30).toString("utf8").split("\0")[0];
+  const det = HOST_DETECTOR_NAMES[eventId] || `HOST_TYPE_${detType}`;
+  return {
+    detector: det,
+    detector_type: detType,
+    flags,
+    host_pid: pid,
+    uid,
+    proc,
+    aux,
+    count,
+    summary: `${det} proc=${proc || "?"} pid=${pid} uid=${uid} aux=0x${aux
       .toString(16)
       .toUpperCase()} x${count}`,
   };
@@ -96,13 +137,23 @@ function toLineProtocol(event, decoded, receivedAtNs) {
     fields.push(
       `detector_type=${decoded.detector_type}i`,
       `aux=${decoded.aux}i`,
-      `src_ip="${escapeLpString(decoded.src_ip)}"`,
-      `dst_ip="${escapeLpString(decoded.dst_ip)}"`,
-      `src_port=${decoded.src_port}i`,
-      `dst_port=${decoded.dst_port}i`,
-      `proto="${escapeLpString(decoded.proto)}"`,
       `summary="${escapeLpString(decoded.summary)}"`
     );
+    if (decoded.src_ip !== undefined) {
+      fields.push(
+        `src_ip="${escapeLpString(decoded.src_ip)}"`,
+        `dst_ip="${escapeLpString(decoded.dst_ip)}"`,
+        `src_port=${decoded.src_port}i`,
+        `dst_port=${decoded.dst_port}i`,
+        `proto="${escapeLpString(decoded.proto)}"`
+      );
+    }
+    if (decoded.proc !== undefined) {
+      fields.push(
+        `proc="${escapeLpString(decoded.proc)}"`,
+        `host_pid=${decoded.host_pid}i`
+      );
+    }
   }
 
   return `idsm_violations,${tags} ${fields.join(",")} ${receivedAtNs}`;
@@ -148,7 +199,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Server misconfigured" });
   }
 
-  const decoded = decodeContext(body.payload);
+  const decoded = decodeContext(body.payload, body.event_id);
   const receivedAtNs = BigInt(Date.now()) * 1_000_000n;
   const lineProtocol = toLineProtocol(body, decoded, receivedAtNs);
 

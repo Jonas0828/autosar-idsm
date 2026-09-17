@@ -1,0 +1,45 @@
+# host_probe offline replay sample: exercises all 10 detectors.
+# Feed with:  ./build/host_probe --events apps/host_probe/baseline/example_events.txt \
+#                --baseline-exec apps/host_probe/baseline/example_exec.txt \
+#                --baseline-files files.txt --baseline-mods mods.txt
+#
+# Format (one event per line, see event.h):
+#   exec   <ts_ms> <pid> <ppid> <uid> <euid> <gid> <egid> <comm> <parent_comm> [exe]
+#   file   <ts_ms> <path> <present 0|1> <mode_octal> <uid> <sha256_hex|->
+#   module <ts_ms> <name>
+#   snap   <ts_ms> <zombies> <cpu_pid> <cpu_uid> <cpu_ppm> <cpu_comm> <mem_pid> <mem_uid> <mem_rss_kb> <mem_comm>
+
+# 1. UNKNOWN_EXEC (0x8021): /tmp/.evil_bin not in the allowlist
+exec   1000  5001  5000  1000 1000 1000 1000 .evil_bin  bash  /tmp/.evil_bin
+
+# 2. PRIV_ESC (0x8022): euid 0 from non-root uid
+exec   2000  5002  5000  1000 0    1000 0    su         bash  /usr/bin/su
+
+# 3. FORK_FLOOD (0x8023): >200 execs inside one 5s window (run with --fork-rate 5 to see it)
+exec   3000  5101  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+exec   3010  5102  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+exec   3020  5103  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+exec   3030  5104  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+exec   3040  5105  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+exec   3050  5106  5000  1000 1000 1000 1000 fork_bomb  bash  /tmp/fork_bomb
+
+# 4. REV_SHELL (0x8024): shell whose parent comm is a network daemon
+exec   4000  5004  7001  1000 1000 1000 1000 bash       netd  /bin/bash
+
+# 5. FILE_MOD (0x8025): /etc/hostname hash differs from files.txt baseline
+file   5000  /etc/hostname 1 0644 0 0000000000000000000000000000000000000000000000000000000000000000
+
+# 6. NEW_SETUID (0x8026): root-owned setuid file not in the file baseline
+file   6000  /tmp/.suid_sh 1 4755 0 -
+
+# 7. KMOD_LOAD (0x8027): module not in mods.txt baseline
+module 7000  evil_module
+
+# 8. ZOMBIE_STORM (0x8028): 150 zombies (run with --zombie-max 50 to see it)
+snap   8000  150 0 0 0 - 0 0 0 -
+
+# 9. RES_EXHAUST (0x8029): one process at 100% CPU / 8 GB RSS
+snap   9000  0  6001  0 1000 cpu_hog  6002  0 8388608 mem_hog
+
+# 10. ROOT_SHELL (0x802A): uid 0 shell via sshd
+exec   10000 5005  7002  0    0    0    0    bash       sshd  /bin/bash

@@ -1,0 +1,18 @@
+# host_probe kernel module baseline -- one module name per line (the
+# first column of /proc/modules). A loaded module whose name is NOT
+# listed alerts as DT_KMOD_LOAD (rootkit / LKM injection indicator).
+#
+# Generate from a trusted boot:
+#   awk '{print $1}' /proc/modules | sort > mods.txt
+#
+# Linux server / VM examples (replace with YOUR module set):
+overlay
+binfmt_misc
+virtio_net
+virtio_blk
+9p
+nf_tables
+aufs
+
+# Android typically builds drivers in; an empty or near-empty baseline
+# is normal there -- any module load at all is then worth alerting on.

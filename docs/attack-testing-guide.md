@@ -220,3 +220,181 @@ for i in $(seq 120); do cansend can0 123#01020304; done  # 单 ID 洪泛 -> 0x80
 ./build/can_probe --pcap capture.pcap --ids apps/can_probe/whitelist/example_ids.txt \
     --soc http://localhost:9000/api/idsm-violations
 ```
+## 主机探针 (host_probe)
+
+面向 Linux / Android 主机的 HIDS 探针（`apps/host_probe/`），告警 ext
+`0x8021`-`0x802A`。两种实时源：netlink `PROC_CONNECTOR`（exec 事件实时，
+需 root）和 `/proc` 轮询（无需 root，`--no-netlink`）；另支持 `--events`
+离线回放。ext 事件 ID 与 SOC 面板 `detector` 标签（HOST_* 名）一一对应。
+
+**前置**（.211 上）：
+
+```bash
+# 生成被监控文件 / 内核模块基线（示例）
+sha256sum /etc/hostname /etc/passwd > /tmp/hp_files.txt
+awk '{print $1}' /proc/modules | sort > /tmp/hp_mods.txt
+# 探针 A：netlink 实时（root）
+sudo ./build/host_probe --baseline-exec apps/host_probe/baseline/example_exec.txt \
+    --baseline-files /tmp/hp_files.txt --baseline-mods /tmp/hp_mods.txt \
+    --soc http://localhost:9000/api/idsm-violations
+# 探针 B：/proc 轮询（普通用户，exec 检测有 scan-ms 级延迟）
+./build/host_probe --no-netlink --scan-ms 1000 \
+    --baseline-exec apps/host_probe/baseline/example_exec.txt \
+    --baseline-files /tmp/hp_files.txt --baseline-mods /tmp/hp_mods.txt \
+    --soc http://localhost:9000/api/idsm-violations
+```
+
+### 1. UNKNOWN_EXEC（未知程序执行，0x8021）
+
+```bash
+cp /bin/sleep /tmp/.evil_malware && /tmp/.evil_malware 60
+# 期望: 0x8021, proc=.evil_malware（白名单外的可执行文件）
+```
+
+### 2. PRIV_ESC（提权，0x8022）
+
+```bash
+passwd   # 非 root 用户执行任何 setuid-root 程序都会命中
+# 期望: 0x8022, flags 含 SETUID（context[1] bit0）
+```
+
+### 3. FORK_FLOOD（fork 风暴，0x8023）
+
+```bash
+# 探针加 --fork-rate 50 降低阈值（默认 200）
+# 注意: 必须让子进程立即退出（if pid == 0 分支），父进程独自继续循环；
+# 裸写 os.fork() 循环是 2^80 的指数 fork 炸弹，会耗尽 PID/内存搞挂机器
+python3 -c 'import os,time
+for _ in range(80):
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(30)   # 子进程活着，保证轮询模式也能扫到
+        os._exit(0)
+time.sleep(35)
+for _ in range(80): os.waitpid(-1, 0)'
+# 期望: 0x8023, aux=窗口内进程数
+# 注意: 轮询模式把新 pid 视为 exec，netlink 模式只统计真实 exec
+```
+
+### 4. REV_SHELL（反弹 shell，0x8024）
+
+检测条件：shell 的父进程 comm 属于网络守护进程集（adbd/sshd/netd...）。
+注意 comm 取自被执行文件名而非 argv[0]，所以 `exec -a netd bash` 这类
+手法无效；要用 prctl(PR_SET_NAME) 把父进程 comm 改成 netd 再派生 shell：
+
+```bash
+python3 - <<'EOF'
+import ctypes, os, time
+libc = ctypes.CDLL(None)
+libc.prctl(15, b"netd", 0, 0, 0)                 # PR_SET_NAME: 本进程 comm -> netd
+pid = os.fork()
+if pid == 0:
+    # 注意: 不能用 "-c sleep 2"，bash 对单命令会 exec 优化直接变成 sleep；
+    # 命令列表可阻止优化，保持 comm=bash 的 shell 进程
+    os.execlp("bash", "bash", "-c", "sleep 2; echo done")
+time.sleep(3)
+os.waitpid(pid, 0)
+EOF
+# 期望: 0x8024, aux=父进程 pid（netd 在默认网络守护进程集内）
+# 已实测验证（2026-09, Ubuntu 20.04 轮询模式）
+```
+
+### 5. FILE_MOD（文件完整性，0x8025）
+
+```bash
+echo tampered | sudo tee -a /etc/hostname      # 摘要变化
+sudo mv /etc/hostname /etc/hostname.bak        # 文件消失 -> HF_MISSING
+# 期望: 0x8025, aux=1(摘要不符) / 2(文件消失, flags 含 MISSING)
+sudo mv /etc/hostname.bak /etc/hostname
+```
+
+> 切勿拿 /etc/passwd 做"文件消失"测试：移走后 sudo 立即失效
+> （`you do not exist in the passwd database`），sshd 也无法建立新连接，
+> 只能用 Docker 或进 recovery 模式恢复。hostname 文件随意折腾，无风险。
+
+### 6. NEW_SETUID（新增 setuid-root 文件，0x8026）
+
+```bash
+sudo cp /bin/dash /tmp/.suid_dash && sudo chmod 4755 /tmp/.suid_dash
+# /tmp/.suid_dash 不在文件基线路径集里 -> 期望: 0x8026
+sudo rm -f /tmp/.suid_dash
+```
+
+### 7. KMOD_LOAD（内核模块加载，0x8027）
+
+```bash
+sudo modprobe dummy      # 选一个不在 /tmp/hp_mods.txt 里的模块
+# 期望: 0x8027, proc=dummy
+sudo rmmod dummy
+```
+
+### 8. ZOMBIE_STORM（僵尸风暴，0x8028）
+
+```bash
+# 探针加 --zombie-max 50（默认 100）
+python3 -c 'import os,time
+for _ in range(80): os.fork() or os._exit(0)
+time.sleep(30)'          # 子进程退出后父进程不回收 -> 80 个僵尸
+# 期望: 0x8028, aux=峰值僵尸数
+```
+
+### 9. RES_EXHAUST（资源耗尽，0x8029）
+
+```bash
+yes > /dev/null &        # CPU 打满单核 -> aux=1(CPU)
+python3 -c 'import time; x=bytearray(600*1024*1024); time.sleep(30)'
+# 探针加 --rss-kb 524288 时 600MB -> aux=2(MEM)
+kill %1
+```
+
+### 10. ROOT_SHELL（root shell，0x802A）
+
+```bash
+sudo bash                # uid=0 shell, parent=sudo -> aux=1(TTY)
+ssh root@localhost       # -> aux=2(NET)
+# 期望: 0x802A
+```
+
+**离线回放**（无 root、无风险复现多类告警）：
+
+```bash
+cat > /tmp/host_attack.events <<'EOF'
+exec 1000 501 500 1000 0 1000 0 sh adbd /system/bin/sh
+exec 2000 502 1 0 0 0 0 bash init /bin/bash
+exec 2001 503 500 1000 0 1000 0 evil_tool sh /usr/bin/evil_tool
+file 3000 /etc/hostname 1 0644 0 cc00000000000000000000000000000000000000000000000000000000000000
+file 3100 /etc/passwd 0 0 0 -
+module 4001 evil_rootkit
+snap 5000 150 900 0 950 hog 901 0 2097152 fat
+EOF
+./build/host_probe --events /tmp/host_attack.events \
+    --baseline-exec apps/host_probe/baseline/example_exec.txt \
+    --baseline-files /tmp/hp_files.txt --baseline-mods /tmp/hp_mods.txt \
+    --soc http://localhost:9000/api/idsm-violations
+```
+
+**注意**：
+
+- 轮询模式 `--scan-ms` 决定快照/模块/文件检测粒度；netlink 模式下 exec
+  事件实时，但快照/模块/文件仍按 `--scan-ms` 周期
+- 文件完整性基线在探针启动时加载一次，改基线需重启探针
+- 首次启动时系统现存进程与模块视为基线，不会产生告警
+- 各检测器有默认静音期（同 key 冷却），重复触发同一攻击不会刷屏
+
+### 主机探针速查表
+
+| type | SEv ext ID | 名称 | aux 含义 |
+|---|---|---|---|
+| 1 | 0x8021 | HOST_UNKNOWN_EXEC | 0 |
+| 2 | 0x8022 | HOST_PRIV_ESC | 0（flags: SETUID/SETGID） |
+| 3 | 0x8023 | HOST_FORK_FLOOD | 窗口内进程数 |
+| 4 | 0x8024 | HOST_REV_SHELL | 父进程 pid |
+| 5 | 0x8025 | HOST_FILE_MOD | 1=摘要不符 / 2=文件消失 |
+| 6 | 0x8026 | HOST_NEW_SETUID | 0 |
+| 7 | 0x8027 | HOST_KMOD_LOAD | 0 |
+| 8 | 0x8028 | HOST_ZOMBIE_STORM | 峰值僵尸数 |
+| 9 | 0x8029 | HOST_RES_EXHAUST | 1=CPU / 2=内存 |
+| 10 | 0x802A | HOST_ROOT_SHELL | 1=TTY / 2=ssh/adb |
+
+主机上下文为 32 字节布局 v1：`detector_type(1) | flags(1) | pid(4) |
+uid/mode(4) | count(4) | aux(4) | name(12) | reserved(2)`，大端。

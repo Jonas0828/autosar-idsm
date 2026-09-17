@@ -1,0 +1,19 @@
+[Unit]
+Description=IDSM SOC ingest server (server.js, port 9000)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=alientek
+WorkingDirectory=/home/alientek/work/code/autosar-idsm/tools/soc_dashboard_local
+Environment=INFLUXDB_TOKEN=idsm-admin-token
+Environment=INFLUXDB_URL=http://localhost:8086
+Environment=INFLUXDB_ORG=idsm
+Environment=INFLUXDB_BUCKET=idsm
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

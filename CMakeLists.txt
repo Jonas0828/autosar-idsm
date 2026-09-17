@@ -92,8 +92,25 @@ if(UNIX AND NOT APPLE)
 
     add_executable(can_probe apps/can_probe/main.cpp)
     target_link_libraries(can_probe PRIVATE can_probe_lib)
+
+    # Host IDS probe (Linux + Android: netlink PROC_CONNECTOR + /proc polling)
+    add_library(host_probe_lib STATIC
+        apps/host_probe/event.cpp
+        apps/host_probe/sha256.cpp
+        apps/host_probe/baseline.cpp
+        apps/host_probe/alert.cpp
+        apps/host_probe/detectors.cpp
+        apps/host_probe/pipeline.cpp
+        apps/host_probe/capture.cpp
+    )
+    target_include_directories(host_probe_lib PUBLIC apps/host_probe)
+    target_link_libraries(host_probe_lib PUBLIC idsm_core idsrm_core)
+    target_compile_options(host_probe_lib PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_executable(host_probe apps/host_probe/main.cpp)
+    target_link_libraries(host_probe PRIVATE host_probe_lib)
 else()
-    message(STATUS "Skipping eth_probe/can_probe: requires Linux (AF_PACKET/SocketCAN)")
+    message(STATUS "Skipping eth_probe/can_probe/host_probe: requires Linux (AF_PACKET/SocketCAN/POSIX procfs)")
 
 endif()
 
@@ -149,6 +166,19 @@ if(TARGET can_probe_lib)
     target_link_libraries(test_can_probe PRIVATE can_probe_lib GTest::gtest_main)
     target_compile_options(test_can_probe PRIVATE -Wall -Wextra)
     gtest_discover_tests(test_can_probe)
+endif()
+
+if(TARGET host_probe_lib)
+    add_executable(test_host_probe
+        tests/host_probe/test_sha256.cpp
+        tests/host_probe/test_events.cpp
+        tests/host_probe/test_detectors.cpp
+        tests/host_probe/test_pipeline.cpp
+        tests/host_probe/test_capture.cpp
+    )
+    target_link_libraries(test_host_probe PRIVATE host_probe_lib GTest::gtest_main)
+    target_compile_options(test_host_probe PRIVATE -Wall -Wextra)
+    gtest_discover_tests(test_host_probe)
 endif()
 
 

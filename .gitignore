@@ -12,3 +12,11 @@ third_party/suricata/suricata-*/
 .vscode/
 *.user
 Thumbs.db
+
+# host_probe: machine-local generated baselines (regenerate per host)
+/files.txt
+/mods.txt
+
+# tool / agent noise
+.claude/
+NUL/
