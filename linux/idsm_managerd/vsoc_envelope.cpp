@@ -83,6 +83,30 @@ const char* nodeTypeToTopicSeg(const std::string& node_type) {
     return "unknown";
 }
 
+std::string buildEventUpEnvelope(const std::string& manufacturer,
+                                 const std::vector<EventItem>& items) {
+    const long long now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    nlohmann::json content = nlohmann::json::array();
+    for (const auto& it : items) {
+        content.push_back({
+            {"eventType", it.event_type},
+            {"severity", it.severity},
+            {"timestamp", it.timestamp_ms > 0 ? it.timestamp_ms : now_ms},
+            {"detail", it.detail},
+        });
+    }
+    const nlohmann::json env = {
+        {"msg_type", "event_up"},
+        {"protocol_version", "1.0"},
+        {"timestamp", now_ms},
+        {"manufacturer", manufacturer},
+        {"content", std::move(content)},
+    };
+    return env.dump();
+}
+
 std::string buildAlertEnvelope(const std::string& manufacturer,
                                const std::string& device_id,
                                const std::string& node_type,

@@ -11,6 +11,7 @@
 |---|---|---|
 | 2023/11/03 | V0.7 | 完善附录中消息格式(史贵振) |
 | 2026/09/18 | V1.0 | 量产化修订:定稿待定项、统一协议、补充安全与可靠性设计 |
+| 2026/09/18 | V1.1 | 补齐车端落地:P0~P2 全部实现并回写(10.3 canonical item 行、11.3 补片重激活、16 章映射更新) |
 
 V1.0 相对 V0.7 的主要变更:
 
@@ -626,6 +627,25 @@ config_type=2(策略使能)items:
 注意:`config_value` 中 `rule_enable` 全 0 的包是**高危操作**,云端审批流
 必须双人复核,签名服务记录操作人(审计,14 章)。同理 `rollback=1` 的回滚包必须双人复核——回滚可能重新引入已修复的检测漏洞,与关检测同等级别管控。
 
+**签名负载(canonical,与 10.1 同规则)**:固定头部行 + 每个 item 一
+行,item 行格式:
+
+```
+item:{config_name}:{base64(item_json)}
+```
+
+其中 `item_json` 为**键按 ASCII 升序、无空白**的紧凑 JSON:
+
+```json
+{"config_name":"app_w_list","config_value":["/usr/sbin/sshd"],"config_version":"c1"}
+```
+
+config_type=2 时 `config_value` 为 object,键同样升序:
+`{"config_name":"rule_enable","config_value":{"IDS-EXEC-001":1},"config_version":"r3"}`。
+值限 ASCII(名单路径/规则 ID 均满足);item 行按 `config_name` ASCII 升序
+排列后拼接。三方(C++ `ConfigManager` / python `mock_vsoc.py` / APK
+`ConfigManager.kt`)逐字节一致,互操作向量进 ctest 与 APK parity 冒烟。
+
 ### 10.4 车端原子切换与回滚
 
 ```
@@ -687,7 +707,11 @@ topic:`oc/devices/{device_id}/sys/log/report`,QoS 1。
 
 - transfer 有效期 24 h,过期碎片清理;
 - 同一 transfer_id 重复分片按 chunk_index 幂等覆盖;
-- 断网期间快照与告警一样入持久队列,恢复后补传(`replay=true`);
+- 断网期间快照与告警一样入持久队列(pending/done/expired 持久目录),
+  恢复后补传(`replay=true`;距生成超过 5 min 的补传必须带 replay 标记);
+- **补片重激活**:云端对整体校验失败的 transfer 发 `negative-ack`(11.2)
+  后,车端可将已归档(done/)的对应 transfer 重新激活补发缺失分片,
+  不必整包重传;
 - HTTP multipart 备用通道保留(v0.7 语义),量产以 MQTT 分包为主。
 
 ---
@@ -789,14 +813,20 @@ topic:`oc/devices/{device_id}/sys/log/report`,QoS 1。
 | 持久队列(9.3) | JSONL+游标(Linux)/ SQLite v2 带 node_type/raw(APK) | 已有 |
 | 规则验签切换(10.4) | `rule_manager`(Linux C++) / `RuleManager.kt`(APK):Ed25519 验签 + 10.1 canonical 与 `mock_vsoc.py` 逐字节一致、seq 防回滚、±24h 时效、target 过滤;python 签名互操作向量进 ctest | **已完成** |
 | 注册状态机(4 章) | managerd `registration.cpp`(--register 一型一证 init,凭据落盘轮换)/ APK `Registration.kt`(persist.idsm.register 开关) | **已完成**(sys/cert 通道归 PKI,mock 返 1004) |
+| 证书生命周期(3.3) | managerd `cert_manager`:剩余有效期 < 1/3 触发 CSR(复用设备私钥,CN=device_id)、`applyResponse` 原子换证 + `.bak` 重叠期、换证后 MQTT 重连;APK 侧不做(APK 证书走系统/HW keystore,属平台层) | **已完成**(Linux) |
 | 属性/心跳上报(8 章) | 两侧均已实现:CONNECT 后 5s 全量 + 300s±10% 周期 + LWT(5.3) | **已完成** |
 | LWT 在线语义(5.3) | mosquitto will_set / paho setWill,属性同通道 nodeStatus=0 | **已完成** |
+| 配置下发(10.3) | `config_manager`(Linux C++) / `ConfigManager.kt`(APK):canonical 验签、名单落盘 `config/current/` + `_versions.json`、rule_enable 审计留痕、独立 max_seq 防回滚 | **已完成**(三端互操作向量进 ctest/parity) |
+| 拒绝闭环(10.4) | 验签失败/seq 回滚/过期/target 不符 → `sys/events/up` 发 `RULE_REJECT`/`CONFIG_REJECT` 事件 + 属性上报原因码;`upgrade_type=2` 显式拒绝(错误码 2002 语义,模糊化) | **已完成**(E2E 覆盖) |
+| 快照分包(11 章) | `log_snapshot`(Linux C++) / `LogSnapshot.kt`(APK):pending/done/expired 持久目录、24 h TTL、断网补传 replay、negative-ack 补片重激活;探针经 UDS `{"cmd":"log_upload"}` 触发 | **已完成**(E2E nack 闭环) |
+| 事件信封(A.7) | `buildEventUpEnvelope` 两侧实现,msg_type `event_up` | **已完成** |
+| nodeStatus 真实状态 | managerd:UDS peer 计数 > 0 → nodeStatus=on 并入属性/心跳;APK 同 | **已完成** |
 | ACL 矩阵(3.5) | EMQX 配置,平台侧 | 待部署 |
-| 快照分包(11 章) | 尚无 | 缺口,低优先 |
 
 适配优先级:P0 = topic 映射 + device_id 三段式 + 信封统一(**已完成**);
 P1 = 属性上报、注册状态机、策略包 seq/防回滚扩展(**已完成**);
-P2 = 快照分包、孪生隔离。
+P2 = 快照分包、配置下发、拒绝闭环、证书续期、nodeStatus(**已完成**)。
+剩余平台侧工作:ACL 部署(3.5)、孪生隔离(12 章)、PKI/CA 服务。
 
 > 注:7 章"rid=+ 单段通配"在实现中勘正——`rid={request_id}` 为键值型
 > 单段,段内嵌 `+` 属 MQTT 非法;车端按自己发出的 request_id 精确订阅

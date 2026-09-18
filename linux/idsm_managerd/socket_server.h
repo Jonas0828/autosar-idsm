@@ -19,6 +19,8 @@ namespace idsm {
 class SocketServer {
 public:
     using LineCallback = std::function<void(const std::string& line)>;
+    /* 探针连接数变化回调(连接线程上下文): 参数为新连接数 */
+    using PeerChangeCallback = std::function<void(int)>;
 
     SocketServer();
     ~SocketServer();
@@ -30,6 +32,11 @@ public:
 
     bool running() const { return m_running->load(); }
 
+    /* 当前已连接探针数(属性上报 nodeStatus 真实数据源, 8 章) */
+    int peerCount() const { return m_peer_count.load(); }
+
+    void setOnPeerChange(PeerChangeCallback cb) { m_peer_cb = std::move(cb); }
+
 private:
     void acceptLoop();
     void handleConn(int fd);
@@ -37,6 +44,8 @@ private:
     std::string m_path;
     int         m_listen_fd{-1};
     LineCallback m_cb;
+    PeerChangeCallback m_peer_cb;
+    std::atomic<int>   m_peer_count{0};
     std::shared_ptr<std::atomic<bool>> m_running;
     std::thread m_thread;
     std::mutex  m_conns_mutex;

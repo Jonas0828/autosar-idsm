@@ -95,6 +95,8 @@ void SocketServer::acceptLoop() {
 
 void SocketServer::handleConn(int fd) {
     auto running = m_running;
+    const int peers = m_peer_count.fetch_add(1) + 1;
+    if (m_peer_cb) m_peer_cb(peers);
     std::string pending;   /* 处理半行 */
     char buf[4096];
     while (running->load()) {
@@ -114,6 +116,8 @@ void SocketServer::handleConn(int fd) {
         m_cb(std::move(pending));
     }
     ::close(fd);
+    const int left = m_peer_count.fetch_sub(1) - 1;
+    if (m_peer_cb) m_peer_cb(left);
 }
 
 }  /* namespace idsm */

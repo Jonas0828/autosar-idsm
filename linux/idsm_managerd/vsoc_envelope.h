@@ -47,4 +47,18 @@ std::string buildAlertEnvelope(const std::string& manufacturer,
                                const std::vector<std::string>& raw_lines,
                                std::string& err);
 
+/* 上行事件条目(sys/events/up, 7 章): 规则/配置拒绝、快照失败等
+ * 管理事件经此通道上报, 形成"拒绝->上报->重发"闭环(10.4);
+ * 设计未约束其 content schema, 此处取 alert 同风格子集。 */
+struct EventItem {
+    std::string event_type;                 /* 如 RULE_REJECT / CONFIG_REJECT */
+    std::string detail;                     /* 车端本地原因(仅辅助排查) */
+    std::string severity{"LOW"};            /* LOW/MEDIUM/HIGH/CRITICAL */
+    long long   timestamp_ms{0};            /* 0 = 取当前时刻 */
+};
+
+/* 构造 event_up 信封 JSON */
+std::string buildEventUpEnvelope(const std::string& manufacturer,
+                                 const std::vector<EventItem>& items);
+
 }  /* namespace idsm */

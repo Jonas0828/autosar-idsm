@@ -44,12 +44,16 @@ public:
             mosquitto_username_pw_set(m_mosq, m_cfg.client_id.c_str(),
                                       m_cfg.token.c_str());
         }
-        if (m_cfg.tls && !m_cfg.cafile.empty()) {
+        if (m_cfg.tls && (!m_cfg.cafile.empty() || !m_cfg.cert_file.empty())) {
             /* 量产建议换成证书/公钥 pinning:
                mosquitto_tls_set 后校验对端证书指纹白名单,
                与 Android 侧 PinningTrustManager 语义一致 */
             mosquitto_tls_set(m_mosq, m_cfg.cafile.c_str(), nullptr,
-                              nullptr, nullptr, nullptr);
+                              m_cfg.cert_file.empty() ? nullptr
+                                  : m_cfg.cert_file.c_str(),
+                              m_cfg.key_file.empty() ? nullptr
+                                  : m_cfg.key_file.c_str(),
+                              nullptr);
         }
         /* broker 可能晚于本进程就绪(冷启动/依赖服务拉起):connect_async
            立即建连,ECONNREFUSED 会同步返回,这里轮询等待后由 loop 线程
@@ -133,6 +137,33 @@ public:
         return true;
     }
 
+    bool reloadTls(const std::string& cert_file,
+                   const std::string& key_file,
+                   std::string& err) override {
+        if (!cert_file.empty()) m_cfg.cert_file = cert_file;
+        if (!key_file.empty()) m_cfg.key_file = key_file;
+        if (!m_cfg.tls || m_cfg.cert_file.empty()) return true;
+        const int rc = mosquitto_tls_set(
+            m_mosq, m_cfg.cafile.empty() ? nullptr : m_cfg.cafile.c_str(),
+            nullptr, m_cfg.cert_file.c_str(),
+            m_cfg.key_file.empty() ? nullptr : m_cfg.key_file.c_str(),
+            nullptr);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            err = "tls reload: " + std::string(mosquitto_strerror(rc));
+            return false;
+        }
+        if (m_connected) {
+            /* 同 updateCredentials: 换证后必须显式 reconnect_async */
+            const int rrc = mosquitto_reconnect_async(m_mosq);
+            if (rrc != MOSQ_ERR_SUCCESS) {
+                err = "reconnect for cert refresh: " +
+                      std::string(mosquitto_strerror(rrc));
+                return false;
+            }
+        }
+        return true;
+    }
+
 private:
     static void onConnect(mosquitto* m, void* obj, int rc) {
         auto* self = static_cast<MosquittoUploader*>(obj);
@@ -144,6 +175,14 @@ private:
             mosquitto_subscribe(m, nullptr,
                                 rulesBroadcastTopic(self->m_cfg.manufacturer,
                                                     self->m_cfg.model_code).c_str(), 1);
+            /* 配置下发(10.3, 签名体系同规则包) + 快照补片(11.2) */
+            mosquitto_subscribe(m, nullptr,
+                                configTopic(self->m_cfg.device_id).c_str(), 1);
+            mosquitto_subscribe(m, nullptr,
+                                configBroadcastTopic(self->m_cfg.manufacturer,
+                                                     self->m_cfg.model_code).c_str(), 1);
+            mosquitto_subscribe(m, nullptr,
+                                snapshotNackTopic(self->m_cfg.device_id).c_str(), 1);
         }
     }
     static void onDisconnect(mosquitto*, void* obj, int rc) {
@@ -200,6 +239,9 @@ public:
     }
     bool subscribe(const std::string& topic, std::string&) override {
         std::fprintf(stderr, "[IDSMD] STUB subscribe %s\n", topic.c_str());
+        return true;
+    }
+    bool reloadTls(const std::string&, const std::string&, std::string&) override {
         return true;
     }
 private:

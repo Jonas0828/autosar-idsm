@@ -20,13 +20,18 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <vector>
 
 #include "alert_queue.h"
 #include "base64.h"
+#include "cert_manager.h"
+#include "config_manager.h"
+#include "log_snapshot.h"
 #include "property_report.h"
 #include "registration.h"
 #include "rule_manager.h"
@@ -606,4 +611,541 @@ TEST(ManagerdEnvelope, AllBadLinesRejected) {
         {"not json", "{\"foo\":1}"}, err);
     EXPECT_TRUE(env.empty());
     EXPECT_FALSE(err.empty());
+}
+
+/* ─── 配置包验签 + 落地(VSOC v1.0 10.3, 与 mock_vsoc.py 互操作) ─── */
+
+namespace {
+
+/* 与 mock_vsoc.py config_item_line 同构 */
+std::string configItemLine(const std::string& name,
+                           const nlohmann::json& value,
+                           const std::string& ver) {
+    const nlohmann::json item = {
+        {"config_name", name},
+        {"config_value", value},
+        {"config_version", ver},
+    };
+    const std::string js = item.dump();   /* 键升序(map)+紧凑, 同 python */
+    return "item:" + name + ":" +
+        idsm::base64Encode(
+            reinterpret_cast<const uint8_t*>(js.data()), js.size());
+}
+
+/* 与 mock_vsoc.py sign_config_bundle 同构的测试包构造(测试自用) */
+nlohmann::json makeConfigBundle(
+    EVP_PKEY* signer, long long seq, const std::string& version,
+    const std::string& target_ecu, const std::string& target_node,
+    const std::string& target_vmodel, int config_type,
+    const std::vector<std::tuple<std::string, nlohmann::json, std::string>>&
+        items,
+    long long issued_at, long long expires_at) {
+    std::vector<std::string> payload;
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& [n, v, ver] : items) {
+        payload.push_back(configItemLine(n, v, ver));
+        arr.push_back({{"config_name", n},
+                       {"config_value", v},
+                       {"config_version", ver}});
+    }
+    std::sort(payload.begin(), payload.end());
+    const std::string canonical = idsm::canonicalConfigBytes(
+        seq, "caic", version, false, target_ecu, target_node, target_vmodel,
+        issued_at, expires_at, config_type, payload);
+    nlohmann::json b;
+    b["msg_type"] = "config_update";
+    b["protocol_version"] = "1.0";
+    b["timestamp"] = 0;
+    b["manufacturer"] = "caic";
+    b["seq"] = seq;
+    b["version"] = version;
+    b["rollback"] = false;
+    b["target"] = {{"ecu", target_ecu},
+                   {"nodeType", target_node},
+                   {"vmodel", target_vmodel}};
+    b["config_type"] = config_type;
+    b["items"] = arr;
+    b["issued_at"] = issued_at;
+    b["expires_at"] = expires_at;
+    b["sig_alg"] = "Ed25519";
+    b["pubkey_id"] = pubkeyIdHex16(signer);
+    b["signature"] = idsm::base64Encode(signEd25519(signer, canonical));
+    return b;
+}
+
+std::string sha256HexStr(const std::string& in) {
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    unsigned int dlen = 0;
+    EVP_Digest(in.data(), in.size(), digest, &dlen, EVP_sha256(), nullptr);
+    std::string out;
+    for (unsigned int i = 0; i < dlen; ++i) {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x", digest[i]);
+        out += buf;
+    }
+    return out;
+}
+
+/* 读整个文本文件(gcc9 下 istreambuf_iterator 不接受流右值) */
+std::string readFile(const fs::path& p) {
+    std::ifstream is(p);
+    return std::string(std::istreambuf_iterator<char>(is),
+                       std::istreambuf_iterator<char>());
+}
+
+/* 自签证书(Ed25519), notBefore/notAfter 为相对现在的秒偏移 */
+std::string makeSelfSignedCert(EVP_PKEY* pkey, long before_off,
+                               long after_off) {
+    X509* x = X509_new();
+    EXPECT_EQ(X509_set_version(x, 2), 1);
+    EXPECT_EQ(ASN1_INTEGER_set(X509_get_serialNumber(x), 1), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x), before_off);
+    X509_gmtime_adj(X509_getm_notAfter(x), after_off);
+    X509_set_pubkey(x, pkey);
+    X509_NAME* name = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const uint8_t*>("test"), -1,
+                               -1, 0);
+    X509_set_issuer_name(x, name);
+    EXPECT_GT(X509_sign(x, pkey, nullptr), 0);   /* Ed25519 无摘要 */
+    BIO* out = BIO_new(BIO_s_mem());
+    PEM_write_bio_X509(out, x);
+    BUF_MEM* bm = nullptr;
+    BIO_get_mem_ptr(out, &bm);
+    std::string pem(bm->data, bm->length);
+    BIO_free(out);
+    X509_free(x);
+    return pem;
+}
+
+template <typename Pred>
+void waitFor(Pred pred, int timeout_ms = 3000) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    while (!pred() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+}  /* namespace */
+
+TEST(ManagerdConfig, SignedBundleAppliesListsAndRuleEnable) {
+    const auto dir = tmpDir("config");
+    const auto marker = fs::path(dir) / "reloaded.marker";
+    const auto key = makeEd25519();
+    const auto now = std::time(nullptr);
+
+    idsm::ConfigManager cm(dir, "touch " + marker.string(),
+                           key.pubkey_spki_b64);
+    std::string err;
+
+    /* config_type=1: 黑白名单落地 */
+    auto b1 = makeConfigBundle(
+        key.pkey, 2, "cfg2", "0x01", "HIDPS", "t99", 1,
+        {{"app_w_list", nlohmann::json::array({"/usr/sbin/sshd",
+                                               "/usr/bin/crond"}), "c1"},
+         {"fw_ip_b_list", nlohmann::json::array({"10.0.0.66"}), "c2"}},
+        now - 60, now + 7 * 24 * 3600);
+    ASSERT_EQ(cm.applyBundle(b1.dump(), testIdentity(), err),
+              idsm::ConfigApply::Applied) << err;
+    EXPECT_TRUE(fs::exists(marker));
+    const auto current = fs::path(dir) / "current";
+    EXPECT_EQ(readFile(current / "app_w_list.list"),
+              "/usr/sbin/sshd\n/usr/bin/crond\n");
+    EXPECT_EQ(readFile(current / "fw_ip_b_list.list"),
+              "10.0.0.66\n");
+    /* 版本台账 + 审计留痕(10.3) */
+    const auto versions =
+        nlohmann::json::parse(std::ifstream(current / "_versions.json"));
+    EXPECT_EQ(versions.at("app_w_list"), "c1");
+    EXPECT_EQ(versions.at("fw_ip_b_list"), "c2");
+    const auto audit = readFile(fs::path(dir) / "audit.log");
+    EXPECT_EQ(std::count(audit.begin(), audit.end(), '\n'), 2);
+
+    /* 防回滚: 同序号重放 -> 拒绝, 文件不变 */
+    EXPECT_EQ(cm.applyBundle(b1.dump(), testIdentity(), err),
+              idsm::ConfigApply::Rejected);
+    EXPECT_TRUE(fs::exists(current / "app_w_list.list"));
+
+    /* 篡改签名 -> 拒绝 */
+    auto bad = b1;
+    bad["signature"] = idsm::base64Encode(std::string(64, 'A'));
+    EXPECT_EQ(cm.applyBundle(bad.dump(), testIdentity(), err),
+              idsm::ConfigApply::Rejected);
+
+    /* 未知名单名 -> 拒绝(验签前格式校验) */
+    auto evil = makeConfigBundle(
+        key.pkey, 3, "cfg3", "0x01", "HIDPS", "t99", 1,
+        {{"evil_list", nlohmann::json::array({"x"}), "c9"}},
+        now - 60, now + 7 * 24 * 3600);
+    EXPECT_EQ(cm.applyBundle(evil.dump(), testIdentity(), err),
+              idsm::ConfigApply::Rejected);
+
+    /* config_type=2: rule_enable 落地 + 审计 */
+    auto b2 = makeConfigBundle(
+        key.pkey, 4, "cfg4", "all", "all", "all", 2,
+        {{"rule_enable", nlohmann::json({{"33001", 1}, {"33002", 0}}), "r1"}},
+        now - 60, now + 7 * 24 * 3600);
+    ASSERT_EQ(cm.applyBundle(b2.dump(), testIdentity(), err),
+              idsm::ConfigApply::Applied) << err;
+    EXPECT_EQ(nlohmann::json::parse(
+                  std::ifstream(current / "rule_enable.json")),
+              nlohmann::json({{"33001", 1}, {"33002", 0}}));
+
+    /* 未命中本机 -> 跳过, 序号已消费 */
+    auto skip = makeConfigBundle(
+        key.pkey, 5, "cfg5", "0x01", "CIDS", "t99", 1,
+        {{"app_w_list", nlohmann::json::array({"x"}), "c3"}},
+        now - 60, now + 7 * 24 * 3600);
+    EXPECT_EQ(cm.applyBundle(skip.dump(), testIdentity(), err),
+              idsm::ConfigApply::Skipped);
+    auto replay5 = skip;
+    replay5["signature"] = std::string();
+    EXPECT_EQ(cm.applyBundle(skip.dump(), testIdentity(), err),
+              idsm::ConfigApply::Rejected);   /* seq 已消费 */
+
+    /* rule_enable 全 0 高危包: 车端照常落地, 云端审批流管控(10.3) */
+    auto b3 = makeConfigBundle(
+        key.pkey, 6, "cfg6", "all", "all", "all", 2,
+        {{"rule_enable", nlohmann::json({{"33001", 0}}), "r2"}},
+        now - 60, now + 7 * 24 * 3600);
+    ASSERT_EQ(cm.applyBundle(b3.dump(), testIdentity(), err),
+              idsm::ConfigApply::Applied) << err;
+    EXPECT_EQ(nlohmann::json::parse(
+                  std::ifstream(current / "rule_enable.json")),
+              nlohmann::json({{"33001", 0}}));
+    const auto audit3 = readFile(fs::path(dir) / "audit.log");
+    EXPECT_EQ(std::count(audit3.begin(), audit3.end(), '\n'), 4);
+
+    EVP_PKEY_free(key.pkey);
+}
+
+/* python 签名配置包 -> C++ 验签互操作; 向量与规则包同文件
+ * (tools/vsoc_mock/gen_rule_vector.py, ctest fixture 现场生成) */
+TEST(ManagerdConfigInterop, PythonSignedBundleApplies) {
+    const char* vec_path = std::getenv("RULE_VECTOR_JSON");
+    if (vec_path == nullptr) {
+        GTEST_SKIP() << "RULE_VECTOR_JSON not set (run under ctest)";
+    }
+    nlohmann::json vec;
+    {
+        std::ifstream is(vec_path);
+        ASSERT_TRUE(is.good()) << "open " << vec_path;
+        vec = nlohmann::json::parse(is);
+    }
+    ASSERT_TRUE(vec.contains("config_bundle")) << "stale vector, re-run fixture";
+
+    const auto dir = tmpDir("configinterop");
+    idsm::ConfigManager cm(dir, "", vec["pubkey_spki_b64"].get<std::string>());
+    std::string err;
+
+    const auto& bundle = vec["config_bundle"];
+    ASSERT_EQ(cm.applyBundle(bundle.dump(), testIdentity(), err),
+              idsm::ConfigApply::Applied) << err;
+
+    /* canonical 逐字节对齐 python 基准 */
+    std::vector<std::string> payload;
+    for (const auto& it : bundle["items"]) {
+        const nlohmann::json canon_item = {
+            {"config_name", it["config_name"]},
+            {"config_value", it["config_value"]},
+            {"config_version", it["config_version"]},
+        };
+        const std::string js = canon_item.dump();
+        payload.push_back(
+            "item:" + it["config_name"].get<std::string>() + ":" +
+            idsm::base64Encode(
+                reinterpret_cast<const uint8_t*>(js.data()), js.size()));
+    }
+    std::sort(payload.begin(), payload.end());
+    const auto& t = bundle["target"];
+    EXPECT_EQ(idsm::canonicalConfigBytes(
+                  bundle["seq"].get<long long>(),
+                  bundle["manufacturer"].get<std::string>(),
+                  bundle["version"].get<std::string>(),
+                  bundle["rollback"].get<bool>(),
+                  t["ecu"].get<std::string>(),
+                  t["nodeType"].get<std::string>(),
+                  t["vmodel"].get<std::string>(),
+                  bundle["issued_at"].get<long long>(),
+                  bundle["expires_at"].get<long long>(),
+                  bundle["config_type"].get<int>(), payload),
+              vec["config_canonical"].get<std::string>());
+
+    /* 名单内容落盘一致 */
+    std::ifstream got(fs::path(dir) / "current" /
+                      (bundle["items"][0]["config_name"].get<std::string>() +
+                       ".list"));
+    const std::string content((std::istreambuf_iterator<char>(got)),
+                              std::istreambuf_iterator<char>());
+    std::string expect;
+    for (const auto& v : bundle["items"][0]["config_value"]) {
+        expect += v.get<std::string>() + "\n";
+    }
+    EXPECT_EQ(content, expect);
+
+    /* 重放同包 -> 防回滚拒绝 */
+    EXPECT_EQ(cm.applyBundle(bundle.dump(), testIdentity(), err),
+              idsm::ConfigApply::Rejected);
+}
+
+/* ─── 日志快照分包(11 章): 元消息 + 分片 + 断点 + negative-ack ─── */
+
+TEST(ManagerdSnapshot, StagePumpReassembleAndNack) {
+    const auto dir = tmpDir("snapshot");
+    const auto file = fs::path(dir) / "attack.pcap";
+    /* 300000 B -> 3 片(128K + 128K + 43904) */
+    std::string original;
+    original.reserve(300000);
+    for (size_t i = 0; i < 300000; ++i) {
+        original += static_cast<char>((i * 31 + 7) & 0xff);
+    }
+    {
+        std::ofstream os(file, std::ios::binary | std::ios::trunc);
+        os << original;
+    }
+
+    idsm::LogSnapshotManager mgr(dir);
+    std::string err;
+    const long long now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto tid = mgr.stageUpload({file.string(), "evt-1", "取证"}, now_ms, err);
+    ASSERT_FALSE(tid.empty()) << err;
+
+    std::vector<std::pair<std::string, std::string>> published;
+    const auto publish = [&published](const std::string& topic,
+                                      const std::string& payload) {
+        published.emplace_back(topic, payload);
+        return true;
+    };
+    ASSERT_TRUE(mgr.pump("caic", "caic_t99_TESTVIN", "0x01", now_ms, publish,
+                         err))
+        << err;
+
+    /* 1 元消息 + 3 分片, 全走 sys/log/report */
+    ASSERT_EQ(published.size(), 4u);
+    const nlohmann::json meta = nlohmann::json::parse(published[0].second);
+    EXPECT_EQ(meta.at("msg_type"), "log_snapshot");
+    EXPECT_EQ(meta.at("transfer_id"), tid);
+    EXPECT_EQ(meta.at("filename"), "attack.pcap");
+    EXPECT_EQ(meta.at("total_size"), 300000);
+    EXPECT_EQ(meta.at("total_chunks"), 3);
+    EXPECT_EQ(meta.at("sha256"), sha256HexStr(original));
+    EXPECT_EQ(meta.at("event_id"), "evt-1");
+    EXPECT_EQ(meta.at("ecuCode"), "0x01");
+    EXPECT_EQ(meta.at("replay"), false);
+    for (const auto& [topic, _] : published) {
+        EXPECT_EQ(topic, "oc/devices/caic_t99_TESTVIN/sys/log/report");
+    }
+
+    /* 分片重组 == 原文件, 片 sha256 自洽 */
+    std::string reassembled;
+    for (size_t i = 1; i < published.size(); ++i) {
+        const auto c = nlohmann::json::parse(published[i].second);
+        EXPECT_EQ(c.at("msg_type"), "log_snapshot_chunk");
+        EXPECT_EQ(c.at("transfer_id"), tid);
+        EXPECT_EQ(c.at("chunk_index"), i - 1);
+        std::string raw;
+        ASSERT_TRUE(idsm::base64Decode(c.at("data").get<std::string>(), raw));
+        EXPECT_EQ(c.at("chunk_sha256"), sha256HexStr(raw));
+        reassembled += raw;
+    }
+    EXPECT_EQ(reassembled, original);
+
+    /* 全部发完 -> 移入 done/, 再 pump 无进展 */
+    EXPECT_TRUE(fs::exists(fs::path(dir) / "done" / tid));
+    published.clear();
+    EXPECT_FALSE(mgr.pump("caic", "d", "0x01", now_ms, publish, err));
+
+    /* negative-ack: 缺失 index 重排, 重发(24h 内) */
+    const auto tid2 = mgr.stageUpload({file.string(), "", ""}, now_ms, err);
+    ASSERT_FALSE(tid2.empty()) << err;
+    ASSERT_TRUE(mgr.pump("caic", "d", "0x01", now_ms, publish, err));
+    ASSERT_TRUE(mgr.onNack(
+        nlohmann::json({{"transfer_id", tid2}, {"missing", {1}}}).dump(),
+        now_ms, err))
+        << err;
+    published.clear();
+    ASSERT_TRUE(mgr.pump("caic", "d", "0x01", now_ms, publish, err));
+    ASSERT_EQ(published.size(), 1u);
+    EXPECT_EQ(nlohmann::json::parse(published[0].second).at("chunk_index"), 1);
+
+    /* 未知 transfer -> 拒绝 */
+    EXPECT_FALSE(mgr.onNack(
+        nlohmann::json({{"transfer_id", "deadbeef"}, {"missing", {0}}}).dump(),
+        now_ms, err));
+
+    /* 过期 transfer(>24h) -> 移入 expired/, nack 不再受理 */
+    const auto tid3 = mgr.stageUpload({file.string(), "", ""}, now_ms, err);
+    ASSERT_FALSE(tid3.empty()) << err;
+    {
+        const auto meta_file = fs::path(dir) / "pending" / tid3 / "meta.json";
+        auto m = nlohmann::json::parse(std::ifstream(meta_file));
+        m["created_ms"] = now_ms - idsm::kSnapshotTransferTtlMs - 1000;
+        std::ofstream os(meta_file, std::ios::trunc);
+        os << m.dump(1);
+    }
+    published.clear();
+    mgr.pump("caic", "d", "0x01", now_ms, publish, err);
+    EXPECT_TRUE(fs::exists(fs::path(dir) / "expired" / tid3));
+    EXPECT_FALSE(mgr.onNack(
+        nlohmann::json({{"transfer_id", tid3}, {"missing", {0}}}).dump(),
+        now_ms, err));
+
+    /* 不存在的文件 -> 拒绝 */
+    EXPECT_TRUE(mgr.stageUpload({"/nonexistent/x.pcap", "", ""}, now_ms, err)
+                    .empty());
+}
+
+/* ─── UDS 连接数(nodeStatus 真实数据源, 8 章) ─── */
+
+TEST(ManagerdSocket, PeerCountTracksConnections) {
+    const auto path = fs::path(tmpDir("sock")) / "probe.sock";
+    idsm::SocketServer server;
+    std::mutex mu;
+    std::vector<std::string> lines;
+    std::string err;
+    ASSERT_TRUE(server.start(path.string(), 0660,
+                             [&mu, &lines](const std::string& line) {
+                                 std::lock_guard<std::mutex> lock(mu);
+                                 lines.push_back(line);
+                             },
+                             err))
+        << err;
+    EXPECT_EQ(server.peerCount(), 0);
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.string().c_str(),
+                 sizeof(addr.sun_path) - 1);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+              0);
+    waitFor([&server] { return server.peerCount() == 1; });
+    EXPECT_EQ(server.peerCount(), 1);
+
+    ASSERT_EQ(::write(fd, "{\"event_id\":1}\n", 15),
+              static_cast<ssize_t>(15));
+    waitFor([&mu, &lines] {
+        std::lock_guard<std::mutex> lock(mu);
+        return !lines.empty();
+    });
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        ASSERT_EQ(lines.size(), 1u);
+        EXPECT_EQ(lines[0], "{\"event_id\":1}");
+    }
+
+    ::close(fd);
+    waitFor([&server] { return server.peerCount() == 0; });
+    EXPECT_EQ(server.peerCount(), 0);
+    server.stop();
+}
+
+/* ─── 证书续期客户端(3.3/4.3): 到期判定 + CSR + 响应处理 ─── */
+
+TEST(ManagerdCert, NeedsRenewalCsrAndResponse) {
+    const auto dir = tmpDir("cert");
+    const auto cert_file = fs::path(dir) / "device.crt";
+    const auto key_file = fs::path(dir) / "device.key";
+    const auto key = makeEd25519();
+    {
+        BIO* out = BIO_new_file(key_file.string().c_str(), "w");
+        PEM_write_bio_PrivateKey(out, key.pkey, nullptr, nullptr, 0, nullptr,
+                                 nullptr);
+        BIO_free(out);
+    }
+    /* 总有效期 25 天, 剩余 5 天 < 25/3 -> 需要续期 */
+    {
+        std::ofstream os(cert_file, std::ios::binary | std::ios::trunc);
+        os << makeSelfSignedCert(key.pkey, -20L * 86400, 5L * 86400);
+    }
+    const auto now = std::time(nullptr);
+    idsm::CertManager cm(cert_file.string(), key_file.string(),
+                         "caic_t99_TESTVIN", "SN123456", "caic");
+    std::string err;
+    EXPECT_TRUE(cm.needsRenewal(now, err)) << err;
+
+    /* 剩余 20 天 > 25/3 -> 不需要 */
+    {
+        std::ofstream os(cert_file, std::ios::binary | std::ios::trunc);
+        os << makeSelfSignedCert(key.pkey, -20L * 86400, 20L * 86400);
+    }
+    EXPECT_FALSE(cm.needsRenewal(now, err));
+
+    /* CSR 请求内容(4.3) */
+    const auto req = cm.buildRequest("rid-cert-1", now * 1000, err);
+    ASSERT_FALSE(req.empty()) << err;
+    const auto rj = nlohmann::json::parse(req);
+    EXPECT_EQ(rj.at("request_id"), "rid-cert-1");
+    EXPECT_EQ(rj.at("type"), 2);
+    EXPECT_EQ(rj.at("content").at("cert_type"), "business");
+    EXPECT_EQ(rj.at("content").at("renew"), true);
+    EXPECT_EQ(rj.at("content").at("device_serial"), "SN123456");
+    EXPECT_NE(rj.at("content").at("csr_pem").get<std::string>()
+                  .find("BEGIN CERTIFICATE REQUEST"),
+              std::string::npos);
+
+    /* rc=1004(归 PKI): 拒绝, 模糊码, 证书文件不变 */
+    const auto before = readFile(cert_file);
+    EXPECT_FALSE(cm.applyResponse(
+        nlohmann::json({{"rc", 1004},
+                        {"rn", "cert_apply_response"},
+                        {"request_id", "rid-cert-1"},
+                        {"paras", {{"msg", "mock 不接管 PKI"}}}})
+            .dump(),
+        "rid-cert-1", err));
+    EXPECT_NE(err.find("1004"), std::string::npos);
+    const auto after = readFile(cert_file);
+    EXPECT_EQ(before, after);
+
+    /* request_id 不匹配 -> 拒绝 */
+    EXPECT_FALSE(cm.applyResponse(
+        nlohmann::json({{"rc", 0}, {"request_id", "other-rid"},
+                        {"paras", {{"cert_pem", "x"}}}})
+            .dump(),
+        "rid-cert-1", err));
+
+    /* rc=0: 原子换证 + 旧证备份(重叠期双认, 3.3) */
+    const std::string new_cert = makeSelfSignedCert(key.pkey, 0, 90L * 86400);
+    ASSERT_TRUE(cm.applyResponse(
+        nlohmann::json({{"rc", 0},
+                        {"rn", "cert_apply_response"},
+                        {"request_id", "rid-cert-1"},
+                        {"paras", {{"cert_pem", new_cert},
+                                   {"serial_number", "02"},
+                                   {"expire_at", now + 90 * 86400}}}})
+            .dump(),
+        "rid-cert-1", err))
+        << err;
+    const auto got = readFile(cert_file);
+    EXPECT_EQ(got, new_cert);
+    EXPECT_TRUE(fs::exists(cert_file.string() + ".bak"));
+
+    /* 换新证书后剩余 90 天 > 总有效期 1/3 -> 不需要续期 */
+    EXPECT_FALSE(cm.needsRenewal(now, err));
+
+    EVP_PKEY_free(key.pkey);
+}
+
+/* ─── 事件上报信封(sys/events/up, 10.4 拒绝闭环) ─── */
+
+TEST(ManagerdEnvelope, EventUpForRejectClosedLoop) {
+    const std::string env = idsm::buildEventUpEnvelope(
+        "caic", {{"RULE_REJECT", "upgrade_type=2 not supported", "MEDIUM",
+                  1726640000123LL}});
+    const auto j = nlohmann::json::parse(env);
+    EXPECT_EQ(j.at("msg_type"), "event_up");
+    EXPECT_EQ(j.at("protocol_version"), "1.0");
+    EXPECT_EQ(j.at("manufacturer"), "caic");
+    const auto& content = j.at("content");
+    ASSERT_EQ(content.size(), 1u);
+    EXPECT_EQ(content[0].at("eventType"), "RULE_REJECT");
+    EXPECT_EQ(content[0].at("severity"), "MEDIUM");
+    EXPECT_EQ(content[0].at("timestamp"), 1726640000123LL);
+    EXPECT_NE(content[0].at("detail").get<std::string>().find(
+                  "upgrade_type=2"),
+              std::string::npos);
 }

@@ -15,6 +15,9 @@
  *       --reload-cmd "systemctl restart idsm-host-probe idsm-eth-probe"
  */
 #include "alert_queue.h"
+#include "cert_manager.h"
+#include "config_manager.h"
+#include "log_snapshot.h"
 #include "mqtt_uploader.h"
 #include "property_report.h"
 #include "registration.h"
@@ -25,6 +28,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -33,9 +38,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <list>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +50,8 @@
 namespace {
 
 std::atomic<bool> g_running{true};
+/* 探针连接数变化 -> 立即增量属性上报(8.3) */
+std::atomic<bool> g_report_now{false};
 
 void onSignal(int) { g_running.store(false); }
 
@@ -59,14 +68,20 @@ struct Args {
 
     std::string data_dir{"/var/lib/idsm"};
     std::string rules_dir;          /* 空 = <data-dir>/rules */
+    std::string config_dir;         /* 空 = <data-dir>/config */
+    std::string snapshot_dir;       /* 空 = <data-dir>/snapshots */
     std::string seed_dir{"/etc/idsm/v0"};
     std::string broker{"localhost:8883"};
     std::string token;
     std::string cafile;
+    std::string cert_file;          /* 车端业务证书(双向 TLS + 续期, 3.3) */
+    std::string key_file;
+    std::string device_serial;      /* 产线注入(一型一证 cert 绑定校验) */
     std::string pubkey_b64;
     std::string reload_cmd;
     std::string ecu_code{"0x00"};
     bool        registration{false};   /* --register: 一型一证 init 流程 */
+    bool        renew_cert{false};     /* --renew-cert: 证书续期客户端 */
     bool        tls{true};
     unsigned    socket_perm{0660};
 };
@@ -84,6 +99,8 @@ void usage(const char* argv0) {
         "  --ecu-code CODE      本机 ECU 编码(默认 0x00, 数据字典)\n"
         "  --data-dir DIR       队列根目录(默认 /var/lib/idsm)\n"
         "  --rules-dir DIR      规则版本目录(默认 <data-dir>/rules)\n"
+        "  --config-dir DIR     配置下发目录(默认 <data-dir>/config)\n"
+        "  --snapshot-dir DIR   日志快照暂存目录(默认 <data-dir>/snapshots)\n"
         "  --seed-dir DIR       出厂基线 v0(默认 /etc/idsm/v0)\n"
         "  --broker HOST:PORT   MQTT broker(默认 localhost:8883)\n"
         "  --no-tls             实验室明文 tcp(mock 云)\n"
@@ -91,6 +108,10 @@ void usage(const char* argv0) {
         "  --register           走一型一证 init 流程(无 --token 且\n"
         "                       无本地凭据时向注册服务换 clientId+token)\n"
         "  --cafile FILE        TLS CA\n"
+        "  --cert-file FILE     车端业务证书(双向 TLS; 配合 --renew-cert)\n"
+        "  --key-file FILE      车端私钥\n"
+        "  --device-serial SN   产线注入序列号(cert 通道 MES 绑定校验)\n"
+        "  --renew-cert         剩余有效期 < 1/3 时自动走 sys/cert 续期\n"
         "  --pubkey-b64 B64     规则签名 Ed25519 公钥(SPKI base64)\n"
         "  --reload-cmd CMD     规则切换后执行(如 systemctl restart ...)\n"
         "  --socket-perm OCT    sink 文件权限(默认 660)\n",
@@ -127,13 +148,19 @@ bool parseArgs(int argc, char** argv, Args& a) {
         else if (k == "--ecu-code")   a.ecu_code = next(k.c_str());
         else if (k == "--data-dir")   a.data_dir = next(k.c_str());
         else if (k == "--rules-dir")  a.rules_dir = next(k.c_str());
+        else if (k == "--config-dir") a.config_dir = next(k.c_str());
+        else if (k == "--snapshot-dir") a.snapshot_dir = next(k.c_str());
         else if (k == "--seed-dir")   a.seed_dir = next(k.c_str());
         else if (k == "--broker")     a.broker = next(k.c_str());
         else if (k == "--token")      a.token = next(k.c_str());
         else if (k == "--cafile")     a.cafile = next(k.c_str());
+        else if (k == "--cert-file")  a.cert_file = next(k.c_str());
+        else if (k == "--key-file")   a.key_file = next(k.c_str());
+        else if (k == "--device-serial") a.device_serial = next(k.c_str());
         else if (k == "--pubkey-b64") a.pubkey_b64 = next(k.c_str());
         else if (k == "--reload-cmd") a.reload_cmd = next(k.c_str());
         else if (k == "--register")   a.registration = true;
+        else if (k == "--renew-cert") a.renew_cert = true;
         else if (k == "--no-tls")     a.tls = false;
         else if (k == "--socket-perm")
             a.socket_perm = static_cast<unsigned>(
@@ -149,6 +176,8 @@ bool parseArgs(int argc, char** argv, Args& a) {
         a.device_id = a.manufacturer + "_" + a.model_code + "_" + a.vin;
     }
     if (a.rules_dir.empty()) a.rules_dir = a.data_dir + "/rules";
+    if (a.config_dir.empty()) a.config_dir = a.data_dir + "/config";
+    if (a.snapshot_dir.empty()) a.snapshot_dir = a.data_dir + "/snapshots";
     return true;
 }
 
@@ -167,6 +196,7 @@ struct NodeChannel {
     std::string   node_type;
     std::string   sock_path;
     std::string   queue_dir;
+    std::shared_ptr<std::atomic<int>> peers;   /* 已连接探针数 */
     idsm::SocketServer server;
     idsm::AlertQueue   queue;
 };
@@ -201,6 +231,7 @@ int main(int argc, char** argv) {
         ch.node_type = nt;
         ch.sock_path = path;
         ch.queue_dir = args.data_dir + "/q-" + idsm::nodeTypeToTopicSeg(nt);
+        ch.peers = std::make_shared<std::atomic<int>>(0);
         std::error_code ec;
         std::filesystem::create_directories(ch.queue_dir, ec);
     }
@@ -219,6 +250,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[IDSMD] seed failed: %s\n", err.c_str());
         return 1;
     }
+    idsm::ConfigManager configs(args.config_dir, args.reload_cmd,
+                                args.pubkey_b64);
+    idsm::LogSnapshotManager snapshots(args.snapshot_dir);
+
+    /* 证书续期客户端(3.3): --renew-cert 且配了业务证书才启用 */
+    std::unique_ptr<idsm::CertManager> cert_mgr;
+    if (args.renew_cert && !args.cert_file.empty()) {
+        cert_mgr = std::make_unique<idsm::CertManager>(
+            args.cert_file, args.key_file, args.device_id,
+            args.device_serial, args.manufacturer);
+    } else if (args.renew_cert) {
+        std::fprintf(stderr, "[IDSMD] --renew-cert ignored: no --cert-file\n");
+    }
 
     idsm::MqttConfig mcfg;
     {
@@ -235,6 +279,8 @@ int main(int argc, char** argv) {
         mcfg.token = args.token;
         mcfg.tls = args.tls;
         mcfg.cafile = args.cafile;
+        mcfg.cert_file = args.cert_file;
+        mcfg.key_file = args.key_file;
     }
     idsm::DeviceIdentity self_id;
     self_id.ecu = args.ecu_code;
@@ -300,10 +346,32 @@ int main(int argc, char** argv) {
         mcfg.token = reg.creds.token;
     }
 
+    /* 拒绝/失败事件上报队列(10.4 闭环: 拒绝 -> sys/events/up -> 云端重发) */
+    std::mutex events_mu;
+    std::deque<std::string> pending_events;
+    auto push_event = [&events_mu, &pending_events, &args](idsm::EventItem item) {
+        std::lock_guard<std::mutex> lock(events_mu);
+        pending_events.push_back(idsm::buildEventUpEnvelope(
+            args.manufacturer, {std::move(item)}));
+    };
+
+    /* 证书续期状态机(3.3/4.3, 语义同注册状态机) */
+    struct CertCtx {
+        enum class St { Idle, Waiting };
+        St st{St::Idle};
+        std::string rid;
+        std::string pending_payload;
+        std::atomic<bool> response_ready{false};
+        long long deadline_ms{0};
+        long long next_attempt_ms{0};
+        int attempts{0};
+    } cert;
+    const std::string cert_req_topic_base =
+        "oc/devices/" + args.device_id + "/sys/cert/request/rid=";
+
     auto uploader = idsm::MqttUploader::create(mcfg);
     if (!uploader->start(
-            [&rules, self_id, &reg](const std::string& topic,
-                                    const std::string& payload) {
+            [&](const std::string& topic, const std::string& payload) {
                 std::string e;
                 if (topic.find("/sys/init/response/") != std::string::npos) {
                     /* 注册响应(4.3): 网络线程只解析, 主循环落盘+重连 */
@@ -313,10 +381,46 @@ int main(int argc, char** argv) {
                     }
                     return;
                 }
+                if (topic.find("/sys/cert/response/") != std::string::npos) {
+                    /* 证书响应: 主循环原子换证 + reloadTls */
+                    cert.pending_payload = payload;
+                    cert.response_ready.store(true);
+                    return;
+                }
+                if (topic.find("/sys/log/report/negative-ack") !=
+                    std::string::npos) {
+                    /* 快照补片(11.2), 仅 24h 内受理 */
+                    const long long nack_now =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now()
+                                .time_since_epoch()).count();
+                    if (!snapshots.onNack(payload, nack_now, e)) {
+                        std::fprintf(stderr, "[IDSMD] snapshot nack: %s\n",
+                                     e.c_str());
+                    }
+                    return;
+                }
+                if (topic.find("/sys/idps/config/update") !=
+                    std::string::npos) {
+                    const auto r = configs.applyBundle(payload, self_id, e);
+                    if (r == idsm::ConfigApply::Rejected) {
+                        std::fprintf(stderr,
+                                     "[IDSMD] config bundle rejected: %s\n",
+                                     e.c_str());
+                        push_event({"CONFIG_REJECT", e, "MEDIUM", 0});
+                    } else if (r == idsm::ConfigApply::Applied) {
+                        std::fprintf(stderr,
+                                     "[IDSMD] config applied, probes reloaded\n");
+                    }
+                    return;
+                }
                 const auto r = rules.applyBundle(payload, self_id, e);
                 if (r == idsm::RuleApply::Rejected) {
                     std::fprintf(stderr, "[IDSMD] rule bundle rejected: %s\n",
                                  e.c_str());
+                    /* 10.4: 拒绝(含 upgrade_type=2 显式拒绝)不静默,
+                     * 经 sys/events/up 上报, 云端可重发 */
+                    push_event({"RULE_REJECT", e, "MEDIUM", 0});
                 } else if (r == idsm::RuleApply::Applied) {
                     std::fprintf(stderr,
                                  "[IDSMD] rules activated, probes reloaded\n");
@@ -329,8 +433,49 @@ int main(int argc, char** argv) {
     }
 
     for (auto& ch : channels) {
+        ch.server.setOnPeerChange(
+            [peers = ch.peers](int n) {
+                peers->store(n);
+                g_report_now.store(true);   /* 8.3 节点上下线即时增量上报 */
+            });
         if (!ch.server.start(ch.sock_path, args.socket_perm,
-                             [&ch](const std::string& line) {
+                             [&ch, &snapshots](const std::string& line) {
+                                 /* 探针下行命令(与告警行同通道, NDJSON):
+                                  * {"cmd":"log_upload","file":...,
+                                  *  "event_id":...,"remark":...}
+                                  * -> 快照分包上传(11 章) */
+                                 if (line.find("\"cmd\"") != std::string::npos) {
+                                     try {
+                                         const auto j =
+                                             nlohmann::json::parse(line);
+                                         if (j.value("cmd", "") == "log_upload") {
+                                             idsm::SnapshotRequest req;
+                                             req.file = j.value("file", "");
+                                             req.event_id =
+                                                 j.value("event_id", "");
+                                             req.remark = j.value("remark", "");
+                                             std::string se;
+                                             const long long now_ms =
+                                                 std::chrono::duration_cast<
+                                                     std::chrono::milliseconds>(
+                                                     std::chrono::system_clock::
+                                                     now().time_since_epoch())
+                                                     .count();
+                                             const auto tid =
+                                                 snapshots.stageUpload(req, now_ms, se);
+                                             if (tid.empty()) {
+                                                 std::fprintf(stderr,
+                                                     "[IDSMD] log_upload rejected: %s\n",
+                                                     se.c_str());
+                                             } else {
+                                                 std::fprintf(stderr,
+                                                     "[IDSMD] snapshot staged: %s\n",
+                                                     tid.c_str());
+                                             }
+                                             return;
+                                         }
+                                     } catch (...) { /* 回落按告警行处理 */ }
+                                 }
                                  std::string e;
                                  ch.queue.append(line, e);
                              },
@@ -417,14 +562,16 @@ int main(int argc, char** argv) {
         if (uploader->connected() &&
             (reg.state == RegState::Registered ||
              reg.state == RegState::Disabled) &&
-            now_ms >= next_report_ms) {
+            (now_ms >= next_report_ms || g_report_now.exchange(false))) {
             std::vector<idsm::NodeProperty> nodes;
             for (const auto& ch : channels) {
                 idsm::NodeProperty n;
                 n.ecu_code = args.ecu_code;
                 n.node_type = ch.node_type;
                 n.node_version = "idsm_managerd/1.0.0";
-                n.node_status = 1;
+                /* nodeStatus 接 UDS 真实连接状态(8 章):
+                 * 探针掉线 -> 0 离线, 重连 -> 1 在线 */
+                n.node_status = ch.peers->load() > 0 ? 1 : 0;
                 n.rule_version = rule_ver;
                 nodes.push_back(std::move(n));
             }
@@ -438,6 +585,119 @@ int main(int argc, char** argv) {
                              nodes.size());
             } else {
                 next_report_ms = now_ms + 10000;   /* 发布失败稍后重试 */
+            }
+        }
+
+        /* 拒绝/失败事件闭环上报(10.4): sys/events/up */
+        if (uploader->connected()) {
+            std::string ev;
+            {
+                std::lock_guard<std::mutex> lock(events_mu);
+                if (!pending_events.empty()) {
+                    ev = pending_events.front();
+                    pending_events.pop_front();
+                }
+            }
+            if (!ev.empty()) {
+                std::string e;
+                if (!uploader->publish(idsm::MqttUploader::eventUpTopic(
+                                           args.device_id), ev, e)) {
+                    std::lock_guard<std::mutex> lock(events_mu);
+                    pending_events.push_front(ev);
+                }
+            }
+        }
+
+        /* 日志快照分包上传(11 章): 断网时持久在 pending/, 恢复后续传 */
+        {
+            std::string e;
+            const bool progressed = snapshots.pump(
+                args.manufacturer, args.device_id, args.ecu_code, now_ms,
+                [&uploader](const std::string& topic,
+                            const std::string& payload) {
+                    std::string pe;
+                    return uploader->publish(topic, payload, pe);
+                },
+                e);
+            if (!e.empty()) {
+                std::fprintf(stderr, "[IDSMD] snapshot pump: %s\n", e.c_str());
+            }
+            if (progressed) any = true;
+        }
+
+        /* 证书续期状态机(3.3/4.3): 剩余 < 1/3 自动申请, 归 PKI */
+        if (cert_mgr &&
+            (reg.state == RegState::Registered ||
+             reg.state == RegState::Disabled)) {
+            if (cert.st == CertCtx::St::Idle && uploader->connected() &&
+                now_ms >= cert.next_attempt_ms) {
+                std::string ce;
+                if (!cert_mgr->needsRenewal(now_ms / 1000, ce)) {
+                    if (!ce.empty()) {
+                        std::fprintf(stderr, "[IDSMD] cert renewal off: %s\n",
+                                     ce.c_str());
+                        cert_mgr.reset();   /* 证书不可读, 停用续期 */
+                    } else {
+                        cert.next_attempt_ms = now_ms + 6LL * 3600 * 1000;
+                    }
+                } else {
+                    cert.rid = idsm::newRequestId();
+                    const std::string req =
+                        cert_mgr->buildRequest(cert.rid, now_ms, ce);
+                    const std::string resp_topic =
+                        "oc/devices/" + args.device_id +
+                        "/sys/cert/response/rid=" + cert.rid;
+                    if (!req.empty() &&
+                        uploader->subscribe(resp_topic, ce) &&
+                        uploader->publish(cert_req_topic_base + cert.rid,
+                                          req, ce)) {
+                        cert.st = CertCtx::St::Waiting;
+                        cert.deadline_ms = now_ms + 30000;
+                        ++cert.attempts;
+                        std::fprintf(stderr,
+                                     "[IDSMD] cert renewal request rid=%s "
+                                     "(attempt %d)\n",
+                                     cert.rid.c_str(), cert.attempts);
+                    } else {
+                        cert.next_attempt_ms = now_ms + 3600 * 1000;
+                        std::fprintf(stderr,
+                                     "[IDSMD] cert request failed: %s\n",
+                                     ce.c_str());
+                    }
+                }
+            } else if (cert.st == CertCtx::St::Waiting) {
+                if (cert.response_ready.exchange(false)) {
+                    std::string ce;
+                    if (cert_mgr->applyResponse(cert.pending_payload,
+                                                cert.rid, ce)) {
+                        std::string e2;
+                        if (uploader->reloadTls(args.cert_file, args.key_file,
+                                                e2)) {
+                            /* 重叠期双认(<=7 天, 3.3), 12h 后再评估 */
+                            cert.next_attempt_ms = now_ms + 12LL * 3600 * 1000;
+                            std::fprintf(stderr,
+                                         "[IDSMD] cert renewed, tls reloaded\n");
+                        } else {
+                            std::fprintf(stderr,
+                                         "[IDSMD] tls reload failed: %s\n",
+                                         e2.c_str());
+                        }
+                    } else {
+                        /* rc!=0 模糊码(6.5, PKI 类返 1004): 24h 退避 */
+                        cert.next_attempt_ms = now_ms + 24LL * 3600 * 1000;
+                        std::fprintf(stderr,
+                                     "[IDSMD] cert renewal rejected: %s\n",
+                                     ce.c_str());
+                    }
+                    cert.st = CertCtx::St::Idle;
+                } else if (now_ms > cert.deadline_ms) {
+                    cert.st = CertCtx::St::Idle;
+                    const long long backoff =
+                        std::min<long long>(60000, 5000LL * (cert.attempts + 1));
+                    cert.next_attempt_ms = now_ms + backoff;
+                    std::fprintf(stderr, "[IDSMD] cert renewal timeout, "
+                                         "retry in %llds\n", backoff / 1000);
+                }
             }
         }
 

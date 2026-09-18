@@ -8,6 +8,9 @@ add_library(idsm_managerd_lib STATIC
     property_report.cpp
     registration.cpp
     rule_manager.cpp
+    config_manager.cpp
+    log_snapshot.cpp
+    cert_manager.cpp
     vsoc_envelope.cpp
 )
 target_include_directories(idsm_managerd_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

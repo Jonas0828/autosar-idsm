@@ -2,7 +2,9 @@
  * mqtt_uploader.h -- MQTT 上行/下行(VSOC 设备接入设计 v1.0 第 6/10 章):
  * 上行 oc/devices/{device_id}/sys/idps/{host|eth|can}/log (QoS1),
  * 下行 oc/devices/{device_id}/sys/idps/rule/update +
- *     oc/vmodel/{mfr}_{model}/sys/idps/rule/update (车型级广播)。
+ *     oc/vmodel/{mfr}_{model}/sys/idps/rule/update (车型级广播) +
+ *     同体系 config/update (10.3) +
+ *     oc/devices/{device_id}/sys/log/report/negative-ack (11.2 补片)。
  *
  * 有 libmosquitto 时编译真实实现(-DHAVE_MOSQUITTO),否则用 Stub
  * (打印日志, 便于无依赖环境联调 UDS/队列/规则链路)。
@@ -26,6 +28,9 @@ struct MqttConfig {
     bool        tls{true};  /* false = 实验室 tcp:// 明文(mock 云) */
     std::string cafile;     /* CA 或自签校验; pinning 见 mosquitto 实现的
                                mosquitto_tls_set 注释 */
+    std::string cert_file;  /* 车端业务证书(双向 TLS; 一型一证换发后由
+                               reloadTls 热更新, 3.3) */
+    std::string key_file;   /* 车端私钥 */
     std::string will_topic;     /* LWT(5.3), 空 = 不带遗嘱 */
     std::string will_payload;   /* nodeStatus=0 单节点属性信封 */
     int         timeout_ms{10000};
@@ -53,6 +58,11 @@ public:
                                    const std::string& token,
                                    std::string& err) = 0;
 
+    /* 证书续期换证后(3.3)热更新 TLS 证书并触发重连; 空参数不更新 */
+    virtual bool reloadTls(const std::string& cert_file,
+                           const std::string& key_file,
+                           std::string& err) = 0;
+
     /* 订阅任意 topic(如按 request_id 精确订阅注册响应, 7 章) */
     virtual bool subscribe(const std::string& topic, std::string& err) = 0;
 
@@ -64,6 +74,19 @@ public:
     static std::string rulesBroadcastTopic(const std::string& mfr,
                                            const std::string& model_code) {
         return "oc/vmodel/" + mfr + "_" + model_code + "/sys/idps/rule/update";
+    }
+    static std::string configTopic(const std::string& device_id) {
+        return "oc/devices/" + device_id + "/sys/idps/config/update";
+    }
+    static std::string configBroadcastTopic(const std::string& mfr,
+                                            const std::string& model_code) {
+        return "oc/vmodel/" + mfr + "_" + model_code + "/sys/idps/config/update";
+    }
+    static std::string snapshotNackTopic(const std::string& device_id) {
+        return "oc/devices/" + device_id + "/sys/log/report/negative-ack";
+    }
+    static std::string eventUpTopic(const std::string& device_id) {
+        return "oc/devices/" + device_id + "/sys/events/up";
     }
 };
 
