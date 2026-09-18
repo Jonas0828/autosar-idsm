@@ -1,6 +1,5 @@
 package com.idsm.manager
 
-import android.os.SystemProperties
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
@@ -183,7 +182,7 @@ class RuleManager(private val context: android.content.Context) {
             val seg = DeviceIdentity.nodeTypeToTopicSeg(nt)
             if (seg != "unknown" &&
                 (tNode.equals("all", true) || tNode.equals(nt, true))) {
-                SystemProperties.set("idsm.reload", seg)
+                SysProps.set("idsm.reload", seg)
             }
         }
         Log.i(TAG, "rules v$version seq=$seq activated")

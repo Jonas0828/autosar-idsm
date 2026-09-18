@@ -224,7 +224,7 @@ class MqttUploader(
 
     /** 实验室明文(mock 云): persist.idsm.plain=1 */
     private fun plainText(): Boolean =
-        android.os.SystemProperties.get("persist.idsm.plain", "0") == "1"
+        SysProps.get("persist.idsm.plain", "0") == "1"
 
     /** TLS pinning: 只信任指定公钥指纹, 忽略系统 CA 库 */
     private fun buildSocketFactory(): SSLSocketFactory {

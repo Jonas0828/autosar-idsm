@@ -69,11 +69,10 @@ object Registration {
     }
 
     fun enabled(): Boolean =
-        android.os.SystemProperties.get("persist.idsm.register", "0") == "1"
+        SysProps.get("persist.idsm.register", "0") == "1"
 
     /** 车队测试直配令牌(--token 等价) */
-    fun cliToken(): String =
-        android.os.SystemProperties.get("persist.idsm.token", "")
+    fun cliToken(): String = SysProps.get("persist.idsm.token", "")
 
     fun newRequestId(): String = UUID.randomUUID().toString()
 

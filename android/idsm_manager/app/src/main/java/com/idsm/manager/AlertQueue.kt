@@ -62,7 +62,7 @@ class AlertQueue(context: Context) :
         readableDatabase.rawQuery(
             "SELECT id,node_type,raw FROM alerts" +
                 " WHERE uploaded=0 AND node_type=? ORDER BY id LIMIT ?",
-            arrayOf(nodeType, limit)
+            arrayOf(nodeType, limit.toString())
         ).use { c ->
             while (c.moveToNext()) {
                 out += Entry(c.getLong(0), c.getString(1), c.getString(2))
