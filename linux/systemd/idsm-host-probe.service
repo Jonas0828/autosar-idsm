@@ -8,7 +8,7 @@ ExecStart=/usr/sbin/idsm/host_probe \
     --baseline-exec /var/lib/idsm/rules/current/exec.txt \
     --baseline-files /var/lib/idsm/rules/current/files.txt \
     --baseline-mods /var/lib/idsm/rules/current/mods.txt \
-    --sink /run/idsm/probe.sock
+    --sink /run/idsm/host.sock
 Restart=on-failure
 RestartSec=2
 # 探针崩了规则热更新靠 managerd 的 reload-cmd(systemctl restart)重启本服务

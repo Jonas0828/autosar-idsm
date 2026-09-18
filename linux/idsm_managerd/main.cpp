@@ -220,19 +220,27 @@ int main(int argc, char** argv) {
         } else {
             mcfg.host = args.broker;
         }
-        mcfg.vin = args.device_id;
+        mcfg.device_id = args.device_id;
+        mcfg.manufacturer = args.manufacturer;
+        mcfg.model_code = args.model_code;
         mcfg.token = args.token;
         mcfg.tls = args.tls;
         mcfg.cafile = args.cafile;
     }
+    idsm::DeviceIdentity self_id;
+    self_id.ecu = args.ecu_code;
+    self_id.vmodel = args.model_code;
+    for (const auto& ch : channels) self_id.node_types.push_back(ch.node_type);
+
     auto uploader = idsm::MqttUploader::create(mcfg);
     if (!uploader->start(
-            [&rules](const std::string&, const std::string& payload) {
+            [&rules, self_id](const std::string&, const std::string& payload) {
                 std::string e;
-                if (!rules.applyBundle(payload, e)) {
+                const auto r = rules.applyBundle(payload, self_id, e);
+                if (r == idsm::RuleApply::Rejected) {
                     std::fprintf(stderr, "[IDSMD] rule bundle rejected: %s\n",
                                  e.c_str());
-                } else {
+                } else if (r == idsm::RuleApply::Applied) {
                     std::fprintf(stderr,
                                  "[IDSMD] rules activated, probes reloaded\n");
                 }

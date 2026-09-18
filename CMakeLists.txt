@@ -145,10 +145,20 @@ gtest_discover_tests(test_idsm)
 gtest_discover_tests(test_idsrm)
 
 if(TARGET idsm_managerd_lib)
+    find_package(Python3 COMPONENTS Interpreter)
     add_executable(test_managerd tests/test_managerd.cpp)
     target_link_libraries(test_managerd PRIVATE idsm_managerd_lib GTest::gtest_main)
     target_compile_options(test_managerd PRIVATE -Wall -Wextra)
-    gtest_discover_tests(test_managerd)
+    gtest_discover_tests(test_managerd
+        PROPERTIES
+            ENVIRONMENT "RULE_VECTOR_JSON=${CMAKE_CURRENT_BINARY_DIR}/rule_vector.json"
+            FIXTURES_REQUIRED RuleVector)
+    # python 签名 -> C++ 验签互操作向量, 测试前现场生成(时间戳随生成时刻)
+    add_test(NAME ManagerdRuleVector.Setup
+             COMMAND Python3::Interpreter
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/vsoc_mock/gen_rule_vector.py
+                     ${CMAKE_CURRENT_BINARY_DIR}/rule_vector.json)
+    set_tests_properties(ManagerdRuleVector.Setup PROPERTIES FIXTURES_SETUP RuleVector)
 endif()
 
 if(TARGET eth_probe_lib)

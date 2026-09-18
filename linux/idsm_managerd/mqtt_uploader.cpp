@@ -34,7 +34,7 @@ public:
         /* 未拿到注册令牌前保持匿名 CONNECT;带用户名但密码为空会被
            认证插件(如 amqtt auth_file)直接拒绝 */
         if (!m_cfg.token.empty()) {
-            mosquitto_username_pw_set(m_mosq, ("idsm-" + m_cfg.vin).c_str(),
+            mosquitto_username_pw_set(m_mosq, ("idsm-" + m_cfg.device_id).c_str(),
                                       m_cfg.token.c_str());
         }
         if (m_cfg.tls && !m_cfg.cafile.empty()) {
@@ -96,7 +96,10 @@ private:
                      mosquitto_connack_string(rc));
         if (rc == 0) {
             self->m_connected = true;
-            mosquitto_subscribe(m, nullptr, rulesTopic(self->m_cfg.vin).c_str(), 1);
+            mosquitto_subscribe(m, nullptr, rulesTopic(self->m_cfg.device_id).c_str(), 1);
+            mosquitto_subscribe(m, nullptr,
+                                rulesBroadcastTopic(self->m_cfg.manufacturer,
+                                                    self->m_cfg.model_code).c_str(), 1);
         }
     }
     static void onDisconnect(mosquitto*, void* obj, int rc) {
@@ -131,8 +134,7 @@ public:
     bool start(DownlinkCallback, std::string&) override {
         std::fprintf(stderr, "[IDSMD] STUB MQTT: no libmosquitto, "
                              "alerts would go to %s:%d topic %s\n",
-                     m_cfg.host.c_str(), m_cfg.port,
-                     alertsTopic(m_cfg.vin).c_str());
+                     m_cfg.host.c_str(), m_cfg.port, m_cfg.device_id.c_str());
         return true;
     }
     void stop() override {}

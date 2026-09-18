@@ -7,7 +7,7 @@ Type=simple
 # 网卡名按车型项目替换
 ExecStart=/usr/sbin/idsm/eth_probe -i eth0 \
     --rules /var/lib/idsm/rules/current/eth.rules \
-    --sink /run/idsm/probe.sock
+    --sink /run/idsm/eth.sock
 Restart=on-failure
 RestartSec=2
 OOMScoreAdjust=-800

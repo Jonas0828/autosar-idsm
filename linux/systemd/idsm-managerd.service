@@ -1,5 +1,5 @@
 [Unit]
-Description=IDSM manager daemon (probe alerts -> MQTT/TLS cloud)
+Description=IDSM manager daemon (probe alerts -> VSOC cloud over MQTT/TLS)
 # 探针通过 UDS 上报, managerd 必须先于探针就绪(探针断连会退避重连, 非硬依赖)
 Before=idsm-host-probe.service idsm-eth-probe.service
 After=network-online.target
@@ -7,16 +7,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# /usr/lib/idsm/ 安装 idsm_managerd, /etc/idsm/managerd.env 放
-# IDSMD_BROKER / IDSMD_VIN / IDSMD_TOKEN / IDSMD_PUBKEY_B64 等
+# /usr/lib/idsm/ 安装 idsm_managerd, /etc/idsm/managerd.env 必配:
+#   IDSMD_DEVICE_ID  三段式设备编号, 如 caic_t99_LXXXXXXX202000001
+#   IDSMD_BROKER     云端 broker, 如 vsoc.example.com:8883
+# 选配: IDSMD_TOKEN(注册后短期令牌)/IDSMD_CAFILE/IDSMD_PUBKEY_B64
 EnvironmentFile=-/etc/idsm/managerd.env
 ExecStart=/usr/lib/idsm/idsm_managerd \
-    --socket /run/idsm/probe.sock \
+    --device-id ${IDSMD_DEVICE_ID} \
+    --socket /run/idsm/host.sock \
+    --sink NIDPS=/run/idsm/eth.sock \
+    --sink CIDS=/run/idsm/can.sock \
+    --ecu-code 0x01 \
     --data-dir /var/lib/idsm \
     --rules-dir /var/lib/idsm/rules \
     --seed-dir /etc/idsm/v0 \
     --broker ${IDSMD_BROKER} \
-    --vin ${IDSMD_VIN} \
     --token ${IDSMD_TOKEN} \
     --cafile ${IDSMD_CAFILE} \
     --pubkey-b64 ${IDSMD_PUBKEY_B64} \

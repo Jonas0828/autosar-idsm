@@ -1,6 +1,8 @@
 /*
- * mqtt_uploader.h -- MQTT 上行/下行,与 Android 侧 MqttUploader 对齐:
- * 上行 ids/alerts/{vin} (QoS1), 下行 ids/rules/{vin} (规则包)。
+ * mqtt_uploader.h -- MQTT 上行/下行(VSOC 设备接入设计 v1.0 第 6/10 章):
+ * 上行 oc/devices/{device_id}/sys/idps/{host|eth|can}/log (QoS1),
+ * 下行 oc/devices/{device_id}/sys/idps/rule/update +
+ *     oc/vmodel/{mfr}_{model}/sys/idps/rule/update (车型级广播)。
  *
  * 有 libmosquitto 时编译真实实现(-DHAVE_MOSQUITTO),否则用 Stub
  * (打印日志, 便于无依赖环境联调 UDS/队列/规则链路)。
@@ -16,7 +18,9 @@ namespace idsm {
 struct MqttConfig {
     std::string host{"localhost"};
     int         port{8883};
-    std::string vin{"UNKNOWN_VIN"};
+    std::string device_id{"UNKNOWN"};
+    std::string manufacturer{"caic"};
+    std::string model_code{"t99"};
     std::string token;      /* 短期令牌, 连接时刷新 */
     bool        tls{true};  /* false = 实验室 tcp:// 明文(mock 云) */
     std::string cafile;     /* CA 或自签校验; pinning 见 mosquitto 实现的
@@ -42,8 +46,13 @@ public:
 
     static std::unique_ptr<MqttUploader> create(const MqttConfig& cfg);
 
-    static std::string alertsTopic(const std::string& vin) { return "ids/alerts/" + vin; }
-    static std::string rulesTopic(const std::string& vin)  { return "ids/rules/" + vin; }
+    static std::string rulesTopic(const std::string& device_id) {
+        return "oc/devices/" + device_id + "/sys/idps/rule/update";
+    }
+    static std::string rulesBroadcastTopic(const std::string& mfr,
+                                           const std::string& model_code) {
+        return "oc/vmodel/" + mfr + "_" + model_code + "/sys/idps/rule/update";
+    }
 };
 
 }  /* namespace idsm */
