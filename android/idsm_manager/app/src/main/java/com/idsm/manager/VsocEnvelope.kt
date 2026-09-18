@@ -64,6 +64,36 @@ object VsocEnvelope {
     fun makeEventId(deviceId: String, nodeType: String, idsMessageHex: String): String =
         "$deviceId-$nodeType-${sha256Hex(idsMessageHex).take(32)}"
 
+    /* ── sys/events/up(10.4 拒绝闭环): 规则/配置拒绝、快照失败等管理事件 ── */
+
+    data class EventItem(
+        val eventType: String,   /* RULE_REJECT / CONFIG_REJECT / ... */
+        val detail: String,
+        val severity: String = "LOW",
+        val timestampMs: Long = 0,   /* 0 = 取当前时刻 */
+    )
+
+    /** 构造 event_up 信封(6.1 外层 + 事件条目) */
+    fun buildEventUp(items: List<EventItem>): String {
+        val now = System.currentTimeMillis()
+        val content = JSONArray()
+        for (it in items) {
+            content.put(JSONObject().apply {
+                put("eventType", it.eventType)
+                put("severity", it.severity)
+                put("timestamp", if (it.timestampMs > 0) it.timestampMs else now)
+                put("detail", it.detail)
+            })
+        }
+        return JSONObject().apply {
+            put("msg_type", "event_up")
+            put("protocol_version", "1.0")
+            put("timestamp", now)
+            put("manufacturer", DeviceIdentity.manufacturer)
+            put("content", content)
+        }.toString()
+    }
+
     /**
      * 批量构造 alert 信封; 全部行非法时返回 null(调用方丢批推进, 防毒丸卡死队列)。
      */

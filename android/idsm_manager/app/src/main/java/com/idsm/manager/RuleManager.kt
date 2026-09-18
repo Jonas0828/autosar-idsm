@@ -72,10 +72,15 @@ class RuleManager(private val context: android.content.Context) {
         symlinkAtomic("v0", current)
     }
 
+    /** 拒绝原因回调(10.4 闭环: 经 sys/events/up 上报云端重发) */
+    var onReject: ((reason: String) -> Unit)? = null
+
     fun onCloudMessage(payload: ByteArray) {
         val err = apply(String(payload))
-        if (err != null && err != "SKIP")
+        if (err != null && err != "SKIP") {
             Log.e(TAG, "rule bundle rejected: $err")
+            onReject?.invoke(err)
+        }
     }
 
     /** @return 错误原因; null = 应用成功, "SKIP" = 未命中 target */
@@ -268,7 +273,8 @@ class RuleManager(private val context: android.content.Context) {
     companion object {
         private const val TAG = "IdsmRules"
         private const val CLOCK_SKEW_SEC = 24L * 3600
-        private const val RULE_SIGNING_PUBKEY_B64 =
+        /* internal: ConfigManager(10.3)与规则包同签名体系, 共用公钥 */
+        internal const val RULE_SIGNING_PUBKEY_B64 =
             "REPLACE_WITH_RULE_SIGNING_ED25519_PUBKEY_B64"
     }
 }

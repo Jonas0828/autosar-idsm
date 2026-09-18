@@ -17,6 +17,8 @@ import android.os.IBinder
  *  - [AlertQueue]        SQLite 持久队列, APK 被杀也不丢
  *  - [MqttUploader]      MQTT 上云: alert 信封/属性心跳/LWT/注册/规则订阅
  *  - [RuleManager]       云端签名规则包验签(v1.0 10.1/10.2)、防回滚、分发
+ *  - [ConfigManager]     签名配置包验签落地(10.3, 与 managerd 同协议)
+ *  - [LogSnapshotManager] 快照分包上传(11 章, 持久暂存 + nack 补片)
  *
  * native 探针不直接碰网络/云, 所有云端交互集中在本服务, 便于安全审计。
  */
@@ -26,18 +28,28 @@ class IdsmService : Service() {
     private lateinit var server: ProbeSocketServer
     private lateinit var uploader: MqttUploader
     private lateinit var rules: RuleManager
+    private lateinit var configs: ConfigManager
+    private lateinit var snapshots: LogSnapshotManager
 
     override fun onCreate() {
         super.onCreate()
         queue = AlertQueue(this)
-        server = ProbeSocketServer(queue)
         rules = RuleManager(this)
-        uploader = MqttUploader(this, queue, rules)
+        configs = ConfigManager(this)
+        snapshots = LogSnapshotManager(this)
+        server = ProbeSocketServer(queue, snapshots)
+        uploader = MqttUploader(this, queue, rules, configs, snapshots) { nt ->
+            server.peerCount(nt)
+        }
 
         rules.start()
+        configs.start()
         server.start()
+        /* 探针连接数变化 -> 立即增量属性上报(nodeStatus 真实状态, 8.3) */
+        server.onPeerChange = { _, _ -> uploader.reportNow.set(true) }
         uploader.start { payload ->
-            // 云端下行: 签名规则包(v1.0 10.2, 单车/车型广播均已按 target 过滤)
+            // 云端下行: 签名规则包(v1.0 10.2, 单车/车型广播均已按 target 过滤);
+            // 配置包走 configListener(见 MqttUploader)
             rules.onCloudMessage(payload)
         }
     }

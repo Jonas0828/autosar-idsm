@@ -54,4 +54,10 @@ assert e["ruleVersion"] == "v0"
 '
 [ $? -ne 0 ] && { echo "FAIL envelope"; ok=0; }
 
+# 第 5 行: config canonical base64, 与 gen_rule_vector.py 的 config_canonical
+# (seq=7 向量, 常量输入) 逐字节一致; 期望值 = base64(config_canonical)。
+EXPECTED_CANON="c2VxPTcKdGVuYW50PWNhaWMKdmVyc2lvbj1jMQpyb2xsYmFjaz0wCnRhcmdldF9lY3U9MHgwMQp0YXJnZXRfbm9kZT1ISURQUwp0YXJnZXRfdm1vZGVsPXQ5OQppc3N1ZWRfYXQ9MTc4OTcxNTc0NQpleHBpcmVzX2F0PTE3OTAzMjA1NDUKY29uZmlnX3R5cGU9MQppdGVtOmFwcF93X2xpc3Q6ZXlKamIyNW1hV2RmYm1GdFpTSTZJbUZ3Y0Y5M1gyeHBjM1FpTENKamIyNW1hV2RmZG1Gc2RXVWlPbHNpTDNWemNpOXpZbWx1TDNOemFHUWlMQ0l2ZFhOeUwySnBiaTlqY205dVpDSmRMQ0pqYjI1bWFXZGZkbVZ5YzJsdmJpSTZJbU14SW4wPQppdGVtOmZ3X2lwX2JfbGlzdDpleUpqYjI1bWFXZGZibUZ0WlNJNkltWjNYMmx3WDJKZmJHbHpkQ0lzSW1OdmJtWnBaMTkyWVd4MVpTSTZXeUl4TUM0d0xqQXVOallpWFN3aVkyOXVabWxuWDNabGNuTnBiMjRpT2lKak1pSjkK"
+GOT_CANON=$(sed -n '5p' "$W/got.txt")
+[ "$GOT_CANON" = "$EXPECTED_CANON" ] || { echo "FAIL config canonical"; ok=0; }
+
 [ "$ok" = 1 ] && echo "PARITY PASS" || echo "PARITY FAIL"

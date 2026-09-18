@@ -12,10 +12,21 @@ import android.util.Log
  * 身份 connect 到各自通道(C++ 侧 --sink @idsm_host 等, 见 vendor .rc)。
  * 探针端是 fire-and-forget: APK 不在则事件丢弃, 持久化责任在本组件。
  */
-class ProbeSocketServer(private val queue: AlertQueue) {
+class ProbeSocketServer(
+    private val queue: AlertQueue,
+    private val snapshots: LogSnapshotManager,
+) {
 
     @Volatile private var running = false
     private val threads = mutableListOf<Thread>()
+    private val peerCounts = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+
+    /** 探针连接数变化回调(nodeType, 新连接数); 属性上报即时增量(8.3) */
+    @Volatile var onPeerChange: ((nodeType: String, peers: Int) -> Unit)? = null
+
+    /** 当前已连接探针数(nodeStatus 真实数据源, 8 章) */
+    fun peerCount(nodeType: String): Int =
+        peerCounts[nodeType]?.get() ?: 0
 
     fun start() {
         running = true
@@ -59,15 +70,40 @@ class ProbeSocketServer(private val queue: AlertQueue) {
     }
 
     private fun handle(conn: LocalSocket, nodeType: String) {
+        val counter = peerCounts.getOrPut(nodeType) { java.util.concurrent.atomic.AtomicInteger(0) }
+        val peers = counter.incrementAndGet()
+        onPeerChange?.invoke(nodeType, peers)
         conn.inputStream.bufferedReader().use { reader ->
             while (running) {
                 val line = reader.readLine() ?: break
                 if (line.isBlank()) continue
+                /* 探针下行命令(与告警行同通道): log_upload -> 快照分包(11 章) */
+                if (line.contains("\"cmd\"") && routeCommand(line)) continue
                 /* 原行进队, 信封解析在发送侧(VsocEnvelope), 与 managerd 一致 */
                 queue.enqueue(nodeType, line)
             }
         }
         runCatching { conn.close() }
+        onPeerChange?.invoke(nodeType, counter.decrementAndGet())
+    }
+
+    /* {"cmd":"log_upload","file":...,"event_id":...,"remark":...} */
+    private fun routeCommand(line: String): Boolean = try {
+        val j = org.json.JSONObject(line)
+        if (j.optString("cmd") != "log_upload") false
+        else {
+            val tid = snapshots.stageUpload(
+                LogSnapshotManager.Request(
+                    file = j.optString("file"),
+                    eventId = j.optString("event_id"),
+                    remark = j.optString("remark"),
+                ),
+                System.currentTimeMillis(),
+            )
+            tid != null
+        }
+    } catch (e: Exception) {
+        false   /* 非命令行, 回落按告警处理 */
     }
 
     companion object {

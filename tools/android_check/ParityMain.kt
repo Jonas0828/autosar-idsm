@@ -5,11 +5,16 @@
  *   kotlinc -classpath <apk-classes> -d t tools/android_check/ParityMain.kt
  *   java -cp <apk-classes>:t:kotlin-stdlib.jar:<android.jar> ParityMainKt
  *
- * 输出 4 行:eventId / HIDPS 事件名 / NIDPS 事件名 / 完整信封 JSON。
+ * 输出 5 行:eventId / HIDPS 事件名 / NIDPS 事件名 / 完整信封 JSON /
+ * config canonical 字节(base64, 应与 gen_rule_vector.py 的
+ * config_canonical 逐字节一致; C++ ConfigManager 同算法,
+ * ConfigInterop fixture 已覆盖)。
  * eventId 应与 python `hashlib.sha256(b"deadbeef").hexdigest()[:32]`
  * 前缀一致(C++ makeEventId 同算法,已在 test_managerd 覆盖)。
  */
 import com.idsm.manager.VsocEnvelope
+import com.idsm.manager.ConfigManager
+import java.util.Base64
 
 fun main() {
     println(VsocEnvelope.makeEventId("caic_t99_UNKNOWN_VIN", "HIDPS", "deadbeef"))
@@ -19,4 +24,12 @@ fun main() {
         "\"timestamp_s\":1726640000,\"timestamp_ns\":123456789," +
         "\"ids_message\":\"deadbeef\"}"
     println(VsocEnvelope.buildAlertEnvelope("HIDPS", "0x02", "v0", listOf(line)))
+    /* 与 tools/vsoc_mock/gen_rule_vector.py 的 config_bundle(seq=7) 同输入 */
+    val itemApp = "item:app_w_list:eyJjb25maWdfbmFtZSI6ImFwcF93X2xpc3QiLCJjb25maWdfdmFsdWUiOlsiL3Vzci9zYmluL3NzaGQiLCIvdXNyL2Jpbi9jcm9uZCJdLCJjb25maWdfdmVyc2lvbiI6ImMxIn0="
+    val itemFw = "item:fw_ip_b_list:eyJjb25maWdfbmFtZSI6ImZ3X2lwX2JfbGlzdCIsImNvbmZpZ192YWx1ZSI6WyIxMC4wLjAuNjYiXSwiY29uZmlnX3ZlcnNpb24iOiJjMiJ9"
+    val canon = ConfigManager.canonicalBytes(
+        7, "caic", "c1", false, "0x01", "HIDPS", "t99",
+        1789715745L, 1790320545L, 1, listOf(itemApp, itemFw),
+    )
+    println(Base64.getEncoder().encodeToString(canon))
 }

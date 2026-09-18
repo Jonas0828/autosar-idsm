@@ -30,10 +30,17 @@ class MqttUploader(
     private val context: Context,
     private val queue: AlertQueue,
     private val rules: RuleManager,
+    private val configs: ConfigManager,
+    private val snapshots: LogSnapshotManager,
+    private val peers: (nodeType: String) -> Int,
 ) {
     private val running = AtomicBoolean(false)
     private var client: MqttAsyncClient? = null
     private var thread: Thread? = null
+    /** 探针连接数变化 -> 立即增量属性上报(8.3) */
+    val reportNow = AtomicBoolean(false)
+    /* 拒绝/失败事件队列(10.4 闭环), pump 中经 sys/events/up 上报 */
+    private val pendingEvents = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
 
     /** 规则包下行回调(网络线程); 注册响应由内部状态机处理 */
     private var onRuleDownlink: ((ByteArray) -> Unit)? = null
@@ -43,8 +50,15 @@ class MqttUploader(
 
     fun start(onRuleDownlink: (ByteArray) -> Unit) {
         this.onRuleDownlink = onRuleDownlink
+        /* 拒绝闭环(10.4): 规则/配置拒绝经 sys/events/up 上报云端重发 */
+        rules.onReject = { enqueueEvent("RULE_REJECT", it) }
+        configs.onReject = { enqueueEvent("CONFIG_REJECT", it) }
         running.set(true)
         thread = Thread({ loop() }, "idsm-mqtt").apply { start() }
+    }
+
+    private fun enqueueEvent(type: String, detail: String) {
+        pendingEvents.add(type to detail)
     }
 
     fun stop() {
@@ -92,6 +106,9 @@ class MqttUploader(
         c.connect(opts).waitForCompletion(10_000)
         c.subscribe(DeviceIdentity.ruleTopic(), 1, ruleListener)
         c.subscribe(DeviceIdentity.ruleBroadcastTopic(), 1, ruleListener)
+        c.subscribe(DeviceIdentity.configTopic(), 1, configListener)
+        c.subscribe(DeviceIdentity.configBroadcastTopic(), 1, configListener)
+        c.subscribe(DeviceIdentity.snapshotNackTopic(), 1, nackListener)
         Log.i(TAG, "connected device_id=${DeviceIdentity.deviceId()} " +
                    "auth=${if (token.isEmpty()) "anonymous" else "token"}")
 
@@ -165,13 +182,14 @@ class MqttUploader(
             val now = System.currentTimeMillis()
 
             /* 属性/心跳(8.3): 全量节点数组, 300s ± 10% 周期 */
-            if (now >= nextReportMs) {
+            if (now >= nextReportMs || reportNow.getAndSet(false)) {
                 val nodes = DeviceIdentity.nodeTypes().map { nt ->
                     PropertyReport.NodeProperty(
                         ecuCode = DeviceIdentity.ecuCode(),
                         nodeType = nt,
                         nodeVersion = "idsm_manager_apk/1.0.0",
-                        nodeStatus = 1,
+                        /* nodeStatus 接 UDS 真实连接状态(8 章) */
+                        nodeStatus = if (peers(nt) > 0) 1 else 0,
                         ruleVersion = rules.currentVersion(),
                     )
                 }
@@ -179,6 +197,30 @@ class MqttUploader(
                             PropertyReport.buildReport(nodes, now))
                 nextReportMs = PropertyReport.nextReportTimeMs(now)
                 Log.i(TAG, "property report (${nodes.size} nodes)")
+            }
+
+            /* 拒绝/失败事件闭环上报(10.4): sys/events/up */
+            var ev = pendingEvents.poll()
+            while (ev != null) {
+                val (type, detail) = ev
+                runCatching {
+                    publishQos1(c, DeviceIdentity.eventUpTopic(),
+                                VsocEnvelope.buildEventUp(
+                                    listOf(VsocEnvelope.EventItem(
+                                        eventType = type, detail = detail,
+                                        severity = "MEDIUM"))))
+                }
+                ev = pendingEvents.poll()
+            }
+
+            /* 日志快照分包上传(11 章): 断网暂存, 恢复后续传 */
+            try {
+                snapshots.pump(DeviceIdentity.ecuCode(), now) { topic, payload ->
+                    publishQos1(c, topic, payload)
+                    true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "snapshot pump failed", e)
             }
 
             /* 逐 nodeType 通道: 队列批次 -> 信封 -> 发布 -> 推进游标 */
@@ -208,6 +250,15 @@ class MqttUploader(
 
     private val ruleListener = IMqttMessageListener { _, msg ->
         onRuleDownlink?.invoke(msg.payload)
+    }
+
+    private val configListener = IMqttMessageListener { _, msg ->
+        configs.onCloudMessage(msg.payload)
+    }
+
+    private val nackListener = IMqttMessageListener { _, msg ->
+        /* 快照补片(11.2), 仅 24h 内受理 */
+        snapshots.onNack(String(msg.payload), System.currentTimeMillis())
     }
 
     private fun publishQos1(c: MqttAsyncClient, topic: String, payload: String) {

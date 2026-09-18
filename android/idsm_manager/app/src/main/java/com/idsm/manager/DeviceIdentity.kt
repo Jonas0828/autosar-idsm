@@ -42,6 +42,21 @@ object DeviceIdentity {
     fun ruleBroadcastTopic(): String =
         "oc/vmodel/${manufacturer}_${modelCode}/sys/idps/rule/update"
 
+    fun configTopic(): String =
+        "oc/devices/${deviceId()}/sys/idps/config/update"
+
+    fun configBroadcastTopic(): String =
+        "oc/vmodel/${manufacturer}_${modelCode}/sys/idps/config/update"
+
+    fun snapshotTopic(): String =
+        "oc/devices/${deviceId()}/sys/log/report"
+
+    fun snapshotNackTopic(): String =
+        "oc/devices/${deviceId()}/sys/log/report/negative-ack"
+
+    fun eventUpTopic(): String =
+        "oc/devices/${deviceId()}/sys/events/up"
+
     fun initRequestTopic(requestId: String): String =
         "oc/devices/${deviceId()}/sys/init/request/rid=$requestId"
 
