@@ -107,9 +107,12 @@ device_id = {manufacturer}_{model_code}_{vin}
 
 | 段 | 来源 | 说明 |
 |---|---|---|
-| manufacturer | 数据字典 | 厂商/租户标识,小写字母数字 |
-| model_code | vsoc_vehicle_model | 车型编码 |
+| manufacturer | 数据字典 | 厂商/租户标识,小写字母数字,**≤16 字符** |
+| model_code | vsoc_vehicle_model | 车型编码,**≤24 字符** |
 | vin | 车辆铭牌 | 17 位车架号,大写 |
+
+> **长度约束**:X.509 CN 上限 64 字节,三段加下划线总长 ≤ 64。
+> 超出时注册服务直接拒绝(1001),数据字典建码时强制校验。
 
 **clientId**(MQTT 接入标识,三段式):
 
@@ -130,8 +133,8 @@ v0.7 列四种方案,量产收敛为两种,其余标记废弃:
 
 | 方案 | 状态 | 适用 |
 |---|---|---|
-| 一机一证 | **量产主方案** | 每台车烧录唯一设备证书,安全等级最高 |
-| 一型一证 + 动态注册 | **量产辅助** | 产线不便一一烧录的车型;注册拿到 clientId+token 后按 4.2 换发业务证书 |
+| 一机一证 | **量产主方案** | 产线烧录唯一设备证书(CN=device_id),该证书**即业务证书**,免换发(见 3.3) |
+| 一型一证 + 动态注册 | **量产辅助** | 产线只烧录同一车型的预置证书;注册后经 cert 通道换发业务证书 |
 | 一型一证免预注册(长期 token) | 废弃 | 长期 token 等价于静态密钥,泄露面大 |
 | 子设备动态注册 | 保留(网关场景) | 主设备上线后子 ECU 申请凭据,由主设备代理托管 |
 
@@ -142,11 +145,18 @@ v0.7 列四种方案,量产收敛为两种,其余标记废弃:
 
 | 阶段 | 流程 | 说明 |
 |---|---|---|
-| 预置 | 产线向 PKI 申请"预置证书"注入安全存储(SE/TEE/HSM) | 预置证书**只能**调用证书申请接口,其他操作返回 403 |
-| 换发 | 设备用预置证书走 4.2 申请业务证书,成功后**就地销毁预置证书私钥** | 业务证书 CN=device_id |
+| 预置 | 产线向 PKI 申请预置证书注入安全存储(SE/TEE/HSM) | 预置证书**只能**调用证书申请接口,其他操作返回 403 |
+| 换发 | **仅一型一证需要**:设备用预置证书走 4.2 cert 通道换发业务证书,成功后**就地销毁预置证书私钥** | 业务证书 CN=device_id;**一机一证的产线证书即业务证书,无此步骤** |
 | 续期 | 业务证书剩余有效期 < 1/3 时自动重新申请,新旧证书重叠期 ≤ 7 天 | 云端按证书序列号做短期双认 |
 | 吊销 | 见 4.4(ECU 更换/退役/疑似泄露) | CRL 下发到 broker,连接层与订阅层双重校验 |
 | 无 RTC 设备 | 设备不校验证书有效期,仅校验链与吊销状态;有效期 enforcement 在云端 | 车端时钟不可信,见 6.3 |
+
+> **预置证书共享场景的绑定校验(安全关键)**:一型一证下同一车型所有设备
+> 预置证书相同(或 CN=DemoCert),若 cert 通道仅凭预置证书 TLS 认证,
+> 则任一被盗预置证书可为**任意 VIN** 申请业务证书。因此 cert/request
+> 必须携带产线写入安全存储的 `device_serial`(产线唯一),云端按制造数据库
+> (MES)核对 `device_serial ↔ VIN` 绑定后才签发;一机一证因预置证书
+> 本身唯一,不依赖此校验。
 
 ### 3.4 凭据与密钥存储
 
@@ -191,6 +201,7 @@ v0.7 列四种方案,量产收敛为两种,其余标记废弃:
 ### 4.2 注册流程(一型一证动态注册)
 
 ```
+一型一证:
 设备(预置证书)              注册服务               信任中心 PKI
    |-- POST .../sys/init/request ------------------->|
    |   (rid=UUID, content{vin, modelId, ...})        |
@@ -198,18 +209,21 @@ v0.7 列四种方案,量产收敛为两种,其余标记废弃:
    |                        | (自动审核或工单审核)    |
    |<-- .../sys/init/response: clientId, token ------|
    |                                                   |
-   |-- POST .../sys/cert/request (csr_pem) ----------->|-- 签发业务证书
+   |-- POST .../sys/cert/request (csr_pem,            |
+   |    device_serial) ------------------------------>|-- 核对 MES 绑定后签发
    |<-- .../sys/cert/response: cert_pem, chain -------|
    |  销毁预置证书私钥, 用业务证书重连 MQTT              |
-```
 
-**一机一证**车型跳过 init,凭产线烧录的设备证书直接走第三步换发业务证书;
-`sys/cert/request` 通道两种方案共用。
+一机一证: 产线烧录的证书 CN=device_id 即业务证书,
+          跳过 init 与 cert 通道,直接 5.1 建立连接
+```
 
 审核策略(2.2.2 定稿):
 
 - **自动审核**:资产库已有该 VIN 且字段匹配(model_code、manufacturer、ecuList
-  拓扑完整)直接放行;新 VIN 走工单。
+  拓扑完整)直接放行。量产爬坡期车企应向平台**预登记生产计划**
+  (VIN 号段/清单),预登记内的全新 VIN 同样自动放行,避免每辆新车
+  都走工单;未预登记的新 VIN 走工单审核。
 - **工单审核**:对接 OA;工单接口规范由集成方提供,本文只约束出参
   `{approved: bool, reason: string, ticket_id: string}`。
 
@@ -246,7 +260,11 @@ content:`{vin(必), modelId(必), engineNumber(可), color(可), productionDate(
 
 **证书申请请求** `oc/devices/{device_id}/sys/cert/request/rid={request_id}`
 
-content:`{csr_pem(必,PKCS#10), cert_type(必,"business"), renew(可,bool 续期标志)}`
+content:`{csr_pem(必,PKCS#10), device_serial(一型一证必,产线注入安全存储), cert_type(必,"business"), renew(可,bool 续期标志)}`
+
+> token 有效期 2 h,仅用于 cert 申请通道的授权补充(双因子:预置证书 TLS + token)。
+> 产线节奏导致 token 过期(PDI/库存期)时重新 init 即可——重复注册幂等,
+> 返回原 clientId 并轮换新 token(4.4)。
 
 **证书申请响应** `oc/devices/{device_id}/sys/cert/response/rid={request_id}`
 
@@ -258,7 +276,7 @@ rc≠0 时 paras 只含 `{msg}`,原因码对终端模糊化(见 6.5)。
 | 场景 | 处理 |
 |---|---|
 | 同 VIN 重复 init | 凭据未泄露:校验资产一致后返回已有 clientId 并**轮换 token**;`force_rotate=true` 时另发新 clientId 并吊销旧绑定 |
-| 整车换 T-box/GW(同 VIN 新硬件) | init 带 `replacement: {old_serial}`;云端吊销旧证书序列号 → 状态回 0 → 重新注册;旧证书进 CRL |
+| 整车换 T-box/GW(同 VIN 新硬件) | init 带 `replacement: true`;**云端按 VIN 检出既有绑定后自动吊销旧证书序列号**(新设备无法也无须提供旧序列号)→ 状态回 0 → 放行新注册;旧证书进 CRL。吊销生效前的短暂窗口由 broker 拒绝旧证书连接兜底 |
 | ECU 更换(探针所在控制器) | 不影响设备证书;零部件解绑/重绑走资产管理流程,`ecuList` 拓扑变更经属性上报同步(8 章) |
 | 车辆退役/报废 | 吊销证书,资产状态置退役,topic 绑定解绑 |
 | 疑似泄露 | 云端一键吊销 + CRL 下发;车端连接失败进入重注册流程 |
@@ -293,8 +311,9 @@ v0.7 的 `sys/conn/request`(RK/SK 会话密钥协商)**废弃**:应用层再加�
 CONNECT 时携带 Will:
 
 - topic:`oc/devices/{device_id}/sys/property/report`(与属性上报同通道)
-- payload:`{"nodeStatus": 0, "offline_reason": "lwt", "timestamp": <broker 打点>}`
+- payload:遵循 6.1 信封,`msg_type="property"`,content 为 `nodeStatus=0` 的单节点数组:`{"msg_type":"property","protocol_version":"1.0","timestamp":<CONNECT 时设备最近已知时间>,"manufacturer":"caic","content":[{"ecuCode":"0x00","nodeType":"HIDPS","nodeStatus":0,...}]}`
 - qos 1, retain false;broker 代发,云端据此置离线并记录 `last_seen`
+  (离线时刻以 broker 接收时间为准,设备填写的 timestamp 可能滞后/超前,见 6.3)
 
 结合 5.2 超时判定与周期属性上报,"在线/离线"语义闭环,
 v0.7 附录"在线(如何实现)"就此定稿。
@@ -333,7 +352,7 @@ v0.7 附录"在线(如何实现)"就此定稿。
 | 属性上报 / LWT | 1 | false | |
 | 检测日志(host/eth/can) | 1 | false | 批量,见 9 章 |
 | 策略/配置下发(单车) | 1 | **true** | 新上线设备立即拿到当前版本,见 10.5 |
-| 策略/配置下发(广播) | 1 | true | vmodel/ecu 过滤在消费端做 |
+| 策略/配置下发(车型级广播) | 1 | true | 仅同车型设备可订阅,消费端再按 target 过滤 |
 | 平台事件下发 | 1 | false | |
 | 日志快照分片 | 1 | false | transfer_id 关联,见 11 章 |
 | 孪生数据重放 | 0 | false | 允许丢 |
@@ -382,9 +401,9 @@ v0.7 附录"在线(如何实现)"就此定稿。
 | 以太网检测 | `oc/devices/{device_id}/sys/idps/eth/log` | 设备 | 平台 | NIDPS 告警日志 |
 | CAN 检测 | `oc/devices/{device_id}/sys/idps/can/log` | 设备 | 平台 | CIDS 告警日志 |
 | 策略 | `oc/devices/{device_id}/sys/idps/rule/update` | 平台 | 设备 | 单车策略下发(签名,10 章) |
-| 策略 | `oc/devices/sys/idps/rule/update` | 平台 | 设备 | 广播下发 |
+| 策略 | `oc/vmodel/{manufacturer}_{model_code}/sys/idps/rule/update` | 平台 | 设备 | 车型级广播(v0.7 的全局广播 topic 废弃,仅平台内部兼容保留) |
 | 配置 | `oc/devices/{device_id}/sys/idps/config/update` | 平台 | 设备 | 单车配置下发(签名) |
-| 配置 | `oc/devices/sys/idps/config/update` | 平台 | 设备 | 广播配置下发 |
+| 配置 | `oc/vmodel/{manufacturer}_{model_code}/sys/idps/config/update` | 平台 | 设备 | 车型级广播配置下发 |
 | 事件 | `oc/devices/{device_id}/sys/events/up` | 设备 | 平台 | OTA 查询等上行事件 |
 | 事件 | `oc/devices/{device_id}/sys/events/down` | 平台 | 设备 | OTA 通知等下行事件 |
 | 快照 | `oc/devices/{device_id}/sys/log/report` | 设备 | 平台 | 日志快照上传(11 章) |
@@ -459,7 +478,7 @@ topic(按探针类型分管道):
 
 ### 9.1 消息格式
 
-批量上报,content 为事件数组,单批 ≤ 64 条:
+批量上报,content 为事件数组;单批 ≤ 64 条且序列化后 ≤ 256 KB,两者先到先限(与 6.2 单消息上限一致):
 
 | 字段 | 必选 | 类型 | 说明 |
 |---|---|---|---|
@@ -471,7 +490,7 @@ topic(按探针类型分管道):
 | nodeType | 必 | string | 探针类型 |
 | ruleVersion | 必 | string | 检测所用策略版本 |
 | replay | 必 | bool | true=断网补传,false=实时 |
-| raw | 必 | object | 原始检测上下文(探针自定义 schema,见附录 A.6) |
+| raw | 必 | object | 原始检测上下文(探针自定义 schema,由数据字典管理,示例见附录 B) |
 
 raw 的权威结构由各探针 schema 定义;HIDPS/NIDPS/CIDS 公共字段
 (进程名/pid、五元组、CAN ID 等)录数据字典统一管理。
@@ -480,9 +499,15 @@ raw 的权威结构由各探针 schema 定义;HIDPS/NIDPS/CIDS 公共字段
 
 | severity | 云端处理 | 车端本地动作 |
 |---|---|---|
-| CRITICAL | 实时推送 VSOC 值班 + 短信 | 可选联动(记录审计日志,联动策略由配置下发) |
+| CRITICAL | 实时推送 VSOC 值班 + 短信 | 被动记录;主动响应见下 |
 | HIGH | 实时入告警库 | 记录 |
 | MEDIUM/LOW | 批量入库 | 记录 |
+
+主动响应约束(新增):IDPS 默认**被动检测**,仅记录与上报。主动动作
+(终止进程、隔离网络等)必须同时满足:① 动作白名单经签名配置下发
+(config_type=2 扩展 `action_enable`);② 云端二次确认(响应信封回执);
+③ 全部动作留审计日志。防止攻击者构造告警触发 IDPS 自杀式响应
+(借刀杀进程造成可用性事故)。
 
 ### 9.3 断网缓存补传(新增,GB 44495 要求)
 
@@ -496,9 +521,10 @@ raw 的权威结构由各探针 schema 定义;HIDPS/NIDPS/CIDS 公共字段
 
 - 管理组件持久队列容量上限可配(默认 10 万条/车);写满后**丢弃最旧并计数**,
   溢出计数经属性上报 `lastAlertSeq` 缺口由云端审计发现。
-- 补传速率 ≤ 实时速率的 2 倍,避免恢复瞬间打爆 broker;
+- 补传速率绝对上限 50 条/秒(可配),避免恢复瞬间打爆 broker;
   补传优先级低于实时事件。
-- 云端收到 `replay=true` 的事件不做实时告警推送,只入库对账。
+- 云端收到 `replay=true` 的事件不做实时告警推送,只入库对账;
+  超过 72 h 去重窗口后到达的重复事件,只入库不重复产生告警工单。
 
 ---
 
@@ -516,6 +542,7 @@ V1.0 定稿:所有可改变车端行为的消息(策略、配置、使能开关)
 
 ```
 seq={seq}\n
+tenant={manufacturer}\n
 version={version}\n
 rollback={0|1}\n
 target_ecu={ecu 或 all}\n
@@ -524,7 +551,7 @@ target_vmodel={model_code 或 all}\n
 issued_at={unix秒}\n
 expires_at={unix秒}\n
 upgrade_type={1|2}\n
-{payload 行按名称排序}\n
+{payload 行按名称排序(ASCII 升序,逐字节)}\n
 ```
 
 payload 行:
@@ -539,10 +566,17 @@ payload 行:
 
 **时效**:`expires_at - issued_at ≤ 7 天`;过期包拒绝。
 
+**车端时钟不可信的缓解**(expires_at 校验依赖设备时钟,而车端 RTC 不可信):
+① 云端保证不签发/不下发过期包,retained 过期场景按 10.5 重发闭环;
+② 设备以最近一次收到的云端响应信封 `timestamp` 校正本地估计,
+   判定过期时容忍 ±24 h 时钟误差(7 天有效期远大于误差);
+③ 防回滚由单调 seq 保证,不依赖 expires_at,时钟异常不会导致
+   接受旧版本规则。
+
 ### 10.2 策略下发格式
 
 topic:`oc/devices/{device_id}/sys/idps/rule/update`(单车)/
-`oc/devices/sys/idps/rule/update`(广播)。QoS 1 + retain。
+`oc/vmodel/{manufacturer}_{model_code}/sys/idps/rule/update`(车型级广播)。QoS 1 + retain。广播按车型隔离:否则某车型检测规则(检测逻辑属于敏感资产)会推给所有车型设备。
 
 | 字段 | 必选 | 类型 | 说明 |
 |---|---|---|---|
@@ -585,7 +619,7 @@ config_type=2(策略使能)items:
 | config_value | 必 | object | `{rule_id: 1\|0}` 显式开关;探针默认遵循,管理组件审计日志留痕 |
 
 注意:`config_value` 中 `rule_enable` 全 0 的包是**高危操作**,云端审批流
-必须双人复核,签名服务记录操作人(审计,14 章)。
+必须双人复核,签名服务记录操作人(审计,14 章)。同理 `rollback=1` 的回滚包必须双人复核——回滚可能重新引入已修复的检测漏洞,与关检测同等级别管控。
 
 ### 10.4 车端原子切换与回滚
 
@@ -600,13 +634,18 @@ config_type=2(策略使能)items:
 
 - 任一步失败即整体拒绝,不留半切换状态;当前版本不受影响。
 - 回滚 = 重新签发 `rollback=1` 指向旧 version 的包,seq 递增,流程一致。
+- 验签失败 / seq 回滚 / 已过期:一律**不切换**当前版本;管理组件通过
+  属性上报(8 章)携带失败原因码,或发 `sys/events/up` 事件通知云端
+  重发,形成"拒绝→上报→重发"闭环,不允许静默停在无规则状态。
 - 探针重启失败(systemd Restart= 兜底)仍持有旧 current,人工介入。
 
 ### 10.5 retained 与新设备上线
 
 单车策略/配置消息 retain=true:设备(重)上线订阅后立即收到当前版本,
-以 retained 包为基线再应用后续增量。广播 topic 的 retained 消息为
-最近一次广播版本,车端按 `target` 过滤与 `seq` 去重。
+以 retained 包为基线再应用后续增量。车型级广播 topic 的 retained 消息
+为最近一次广播版本,车端按 `target` 过滤与 `seq` 去重。
+注意:retained 包可能因车端库存期超过 `expires_at` 而过期——此时**不切换**
+当前版本,管理组件经属性上报通知云端重发(10.4),而不是静默丢弃规则。
 
 ---
 
@@ -702,7 +741,7 @@ topic:`oc/devices/{device_id}/sys/log/report`,QoS 1。
 | sha256 | varchar(64) | 包摘要 |
 | signature / pubkey_id | varchar | 签名留痕 |
 | operator | varchar(32) | 签发操作人(审计) |
-| approved_by | varchar(32) | 双人复核人(高危配置必填) |
+| approved_by | varchar(32) | 双人复核人(rule_enable 全 0 或 rollback=1 时必填) |
 | created_at | timestamp | — |
 
 车型/零部件管理表沿用 v0.7,在资产表增加 `access_status` 字段(只读,
