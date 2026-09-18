@@ -2,11 +2,13 @@
 """mock_vsoc -- VSOC 云端 mock,用于车端按《VSOC 设备接入详细设计 v1.0》开发联调。
 
 单进程内含三件套:
-  1. amqtt MQTT broker(默认 127.0.0.1:18883, 实验室无认证)
-  2. 注册服务 mock: 应答 sys/init/request -> clientId+token; sys/cert/request
-     返回 1004(mock 不接管 PKI)
-  3. 规则签名服务 mock(python 参考实现): Ed25519 签名 + 设计文档 10.1
-     canonical 字节序列,向单车 topic 发布签名规则包(retain)
+ 2. 注册/证书服务 mock: 应答 sys/init/request -> clientId+token;
+     sys/cert/request 返回 1004(mock 不接管 PKI)
+ 3. 规则/配置签名服务 mock(python 参考实现): Ed25519 签名 + 设计文档
+     10.1/10.3 canonical 字节序列,向单车 topic 发布签名包(retain)
+ 4. 快照收集器(11 章): 重组分片、校验 chunk/整体 sha256,
+     支持 --drop-chunk 模拟丢片并走 negative-ack 补片闭环
+ 5. 上行事件校验(10.4 拒绝闭环): sys/events/up 信封
 
 canon 实现是本仓库 C++ 侧(linux/idsm_managerd)的互操作基准,
 两侧必须逐字节一致。
@@ -19,6 +21,11 @@ canon 实现是本仓库 C++ 侧(linux/idsm_managerd)的互操作基准,
   python3 tools/vsoc_mock/mock_vsoc.py --sign-rule \
       --device caic_t99_LXXXXXXX202000001 --seq 1 --version v8 \
       --rule 'alert tcp any any -> any 3389 (msg:"RDP"; sid:10001;)'
+
+  # 下发签名配置包(10.3):
+  python3 tools/vsoc_mock/mock_vsoc.py --sign-config \
+      --device caic_t99_LXXXXXXX202000001 --seq 1 --version c1 \
+      --item '{"config_name":"process_w_list","config_value":["/usr/sbin/sshd"],"config_version":"c1"}'
 """
 import argparse
 import asyncio
@@ -59,8 +66,82 @@ def canonical_bytes(seq, tenant, version, rollback, target, upgrade_type,
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def canonical_config_bytes(seq, tenant, version, rollback, target, config_type,
+                           payload_lines, issued_at, expires_at):
+    """配置包 canonical(10.3, 与 config 行替换 upgrade_type 行)。"""
+    lines = [
+        f"seq={seq}",
+        f"tenant={tenant}",
+        f"version={version}",
+        f"rollback={1 if rollback else 0}",
+        f"target_ecu={target['ecu']}",
+        f"target_node={target['nodeType']}",
+        f"target_vmodel={target['vmodel']}",
+        f"issued_at={issued_at}",
+        f"expires_at={expires_at}",
+        f"config_type={config_type}",
+    ] + sorted(payload_lines)
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def config_item_line(name, value, version):
+    """item canonical 行: item:{name}:{b64(json 键升序紧凑)}。
+    与 C++ config_manager.cpp / Android ConfigManager.kt 逐字节一致。"""
+    item = {"config_name": name, "config_value": value,
+            "config_version": version}
+    js = json.dumps(item, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True)
+    return f"item:{name}:{b64(js.encode())}"
+
+
+def sign_config_bundle(key, *, seq, tenant, version, rollback, target,
+                       config_type, items, validity_s=7 * 24 * 3600):
+    """构造签名配置包(设计文档 10.3),返回可发布的 dict。
+    items: [(config_name, config_value, config_version), ...]"""
+    now = int(time.time())
+    payload_lines = [config_item_line(n, v, ver) for n, v, ver in items]
+    canonical = canonical_config_bytes(seq, tenant, version, rollback, target,
+                                       config_type, payload_lines, now,
+                                       now + validity_s)
+    sig = key.sign(canonical)
+    bundle = {
+        "msg_type": "config_update",
+        "protocol_version": "1.0",
+        "timestamp": int(time.time() * 1000),
+        "manufacturer": tenant,
+        "seq": seq,
+        "version": version,
+        "rollback": rollback,
+        "target": target,
+        "config_type": config_type,
+        "items": [{"config_name": n, "config_value": v, "config_version": ver}
+                  for n, v, ver in items],
+        "issued_at": now,
+        "expires_at": now + validity_s,
+        "sig_alg": "Ed25519",
+        "pubkey_id": hashlib.sha256(key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw)).hexdigest()[:16],
+        "signature": b64(sig),
+    }
+    return bundle, canonical
+
+
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
+
+
+def load_private_key(path):
+    """兼容 cryptography 2.x(backend 必传)与 3.1+(backend 可选)。"""
+    from cryptography.hazmat.primitives import serialization
+
+    data = open(path, "rb").read()
+    try:
+        return serialization.load_pem_private_key(data, password=None)
+    except TypeError:   # <3.1: backend 必传
+        from cryptography.hazmat.backends import default_backend
+        return serialization.load_pem_private_key(
+            data, password=None, backend=default_backend())
 
 
 def sign_rule_bundle(key, *, seq, tenant, version, rollback, target,
@@ -118,11 +199,15 @@ BROKER_CONFIG = {
 }
 
 
-def start_paho_services(expect_alerts, alert_min, stop_evt):
-    """注册服务 mock + 告警接收校验器,跑在独立线程(paho loop)。"""
+def start_paho_services(args, stop_evt):
+    """注册/证书服务 mock + 告警/快照/事件接收校验器(paho loop)。"""
+    expect_alerts = args.expect_alerts
+    alert_min = args.alert_min
     import paho.mqtt.client as mqtt
 
-    stats = {"alerts": 0, "bad": []}
+    stats = {"alerts": 0, "bad": [], "events": 0, "snapshots": 0}
+    transfers = {}   # transfer_id -> {meta, chunks{idx: bytes}, dropped:set,
+                     #  nacked: bool}
 
     def on_connect(client, _ud, _flags, rc, _props=None):
         if rc != 0:
@@ -132,6 +217,8 @@ def start_paho_services(expect_alerts, alert_min, stop_evt):
         client.subscribe("oc/devices/+/sys/init/request/+")
         client.subscribe("oc/devices/+/sys/cert/request/+")
         client.subscribe("oc/devices/+/sys/property/report")
+        client.subscribe("oc/devices/+/sys/events/up")
+        client.subscribe("oc/devices/+/sys/log/report")
         if expect_alerts:
             for seg in ("host", "eth", "can"):
                 client.subscribe(f"oc/devices/+/sys/idps/{seg}/log")
@@ -182,6 +269,19 @@ def start_paho_services(expect_alerts, alert_min, stop_evt):
                 f"{n.get('nodeType')}:{'on' if n.get('nodeStatus') == 1 else 'off'}"
                 f"/rv={n.get('ruleVersion')}" for n in nodes)
             print(f"[mock] property from {did}: {desc}", flush=True)
+        elif topic.endswith("/sys/events/up"):
+            ok, why = validate_event_envelope(payload)
+            if ok:
+                stats["events"] += len(payload.get("content", []))
+                for e in payload.get("content", []):
+                    print(f"[mock] event_up {e.get('eventType')}: "
+                          f"{e.get('detail', '')[:80]}", flush=True)
+            else:
+                stats["bad"].append((topic, why))
+                print(f"[mock] BAD event envelope: {why}", flush=True)
+        elif topic.endswith("/sys/log/report"):
+            handle_snapshot_chunk(client, did, payload, transfers, stats,
+                                  args)
 
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     c.on_connect = on_connect
@@ -200,16 +300,101 @@ def start_paho_services(expect_alerts, alert_min, stop_evt):
         stop_evt.wait(expect_alerts)
         c.loop_stop()
         print(f"[mock] expect window end: alerts={stats['alerts']} "
+              f"events={stats['events']} snapshots={stats['snapshots']} "
               f"bad={len(stats['bad'])}", flush=True)
         for t, why in stats["bad"]:
             print(f"  BAD {t}: {why}", flush=True)
-        rc = 0 if stats["alerts"] >= alert_min and not stats["bad"] else 1
+        rc = 0 if (stats["alerts"] >= alert_min and
+                   stats["events"] >= args.expect_events and
+                   stats["snapshots"] >= args.expect_snapshot and
+                   not stats["bad"]) else 1
         print(f"[mock] RESULT {'PASS' if rc == 0 else 'FAIL'}", flush=True)
         return rc
     while not stop_evt.is_set():
         time.sleep(0.5)
     c.loop_stop()
     return 0
+
+
+def handle_snapshot_chunk(client, did, payload, transfers, stats, args):
+    """快照分片收集(11 章): 重组 + sha256 校验 + 丢片 nack 闭环。"""
+    mtype = payload.get("msg_type")
+    if mtype == "log_snapshot":
+        tid = payload.get("transfer_id", "?")
+        transfers[tid] = {"meta": payload, "chunks": {}, "dropped": set(),
+                          "nacked": False}
+        print(f"[mock] snapshot meta {tid}: {payload.get('filename')} "
+              f"{payload.get('total_size')}B x{payload.get('total_chunks')} "
+              f"replay={payload.get('replay')}", flush=True)
+        return
+    if mtype != "log_snapshot_chunk":
+        stats["bad"].append(("sys/log/report", f"msg_type={mtype}"))
+        return
+    tid = payload.get("transfer_id", "?")
+    tr = transfers.get(tid)
+    if tr is None:
+        stats["bad"].append(("sys/log/report", f"chunk w/o meta {tid}"))
+        return
+    idx = payload.get("chunk_index")
+    total = tr["meta"].get("total_chunks", 0)
+    if not isinstance(idx, int) or idx < 0 or idx >= total:
+        stats["bad"].append(("sys/log/report", f"bad chunk_index {idx}"))
+        return
+    try:
+        raw = base64.b64decode(payload.get("data", ""))
+    except Exception:
+        stats["bad"].append(("sys/log/report", "chunk b64"))
+        return
+    if hashlib.sha256(raw).hexdigest() != payload.get("chunk_sha256"):
+        stats["bad"].append(("sys/log/report", f"chunk {idx} sha256"))
+        return
+    if idx == args.drop_chunk and idx not in tr["dropped"] and not tr["nacked"]:
+        # 模拟丢片: 触发 negative-ack 补片闭环(11.2)
+        tr["dropped"].add(idx)
+        print(f"[mock] snapshot {tid}: drop chunk {idx} once (sim loss)",
+              flush=True)
+        return
+    tr["chunks"][idx] = raw
+    missing = [i for i in range(total) if i not in tr["chunks"]]
+    if missing and not tr["nacked"]:
+        tr["nacked"] = True
+        client.publish(f"oc/devices/{did}/sys/log/report/negative-ack",
+                       json.dumps({"transfer_id": tid, "missing": missing}),
+                       qos=1)
+        print(f"[mock] snapshot {tid}: nack missing={missing}", flush=True)
+        return
+    if missing:
+        return   # 等补片
+    whole = b"".join(tr["chunks"][i] for i in range(total))
+    want = tr["meta"].get("sha256", "")
+    if hashlib.sha256(whole).hexdigest() != want:
+        stats["bad"].append(("sys/log/report", "whole sha256 mismatch"))
+        print(f"[mock] BAD snapshot {tid}: whole sha256 mismatch", flush=True)
+        return
+    stats["snapshots"] += 1
+    out = f"/tmp/mock_snapshot_{tid}.bin"
+    with open(out, "wb") as f:
+        f.write(whole)
+    print(f"[mock] SNAPSHOT OK {tid}: {len(whole)}B sha256={want[:16]}.. "
+          f"-> {out}", flush=True)
+
+
+def validate_event_envelope(env):
+    """sys/events/up 轻量校验(6.1 信封 + 10.4 事件条目)。"""
+    if env.get("msg_type") != "event_up":
+        return False, f"msg_type={env.get('msg_type')}"
+    if env.get("protocol_version") != "1.0":
+        return False, "protocol_version"
+    content = env.get("content")
+    if not isinstance(content, list) or not content:
+        return False, "content"
+    for e in content:
+        for k in ("eventType", "severity", "timestamp", "detail"):
+            if k not in e:
+                return False, f"missing {k}"
+        if e["severity"] not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            return False, f"severity={e['severity']}"
+    return True, ""
 
 
 def validate_alert_envelope(env, seg):
@@ -259,13 +444,30 @@ def main():
     ap.add_argument("--expect-alerts", type=int, default=0,
                     help="运行 N 秒等待告警并校验信封,结束打印 PASS/FAIL")
     ap.add_argument("--alert-min", type=int, default=1)
+    ap.add_argument("--expect-events", type=int, default=0,
+                    help="窗口内最少上行事件数(10.4 拒绝闭环)")
+    ap.add_argument("--expect-snapshot", type=int, default=0,
+                    help="窗口内最少完整快照数(11 章)")
+    ap.add_argument("--drop-chunk", type=int, default=-1,
+                    help="快照收集器丢弃首个该 index 的分片,模拟丢片走 nack")
     ap.add_argument("--sign-rule", action="store_true",
                     help="签名并向 --device 发布规则包后退出(需 broker 已运行)")
+    ap.add_argument("--sign-config", action="store_true",
+                    help="签名并向 --device 发布配置包后退出(需 broker 已运行)")
+    ap.add_argument("--config-type", type=int, default=1,
+                    help="1 黑白名单 / 2 策略使能")
+    ap.add_argument("--item", action="append", default=[],
+                    help="配置项 JSON 串(完整 "
+                         '{"config_name":...,"config_value":...,'
+                         '"config_version":...}), 可重复')
     ap.add_argument("--device", default="caic_t99_LXXXXXXX202000001")
     ap.add_argument("--tenant", default="caic")
     ap.add_argument("--seq", type=int, default=1)
     ap.add_argument("--version", default="v8")
     ap.add_argument("--rollback", action="store_true")
+    ap.add_argument("--upgrade-type", type=int, default=1,
+                    help="1 内联规则 / 2 URL 规则包(车端显式拒绝)")
+    ap.add_argument("--download-uri", default="https://rules.example/pkg/v8.tar.gz")
     ap.add_argument("--rule", action="append", default=[])
     ap.add_argument("--ecu", default="all")
     ap.add_argument("--node-type", default="all")
@@ -275,6 +477,8 @@ def main():
 
     if args.sign_rule:
         return do_sign_rule(args)
+    if args.sign_config:
+        return do_sign_config(args)
 
     stop_evt = threading.Event()
     def sig(_s, _f):
@@ -285,8 +489,7 @@ def main():
     result = {}
 
     def run_services():
-        result["rc"] = start_paho_services(args.expect_alerts,
-                                           args.alert_min, stop_evt)
+        result["rc"] = start_paho_services(args, stop_evt)
         stop_evt.set()
 
     st = threading.Thread(target=run_services, daemon=True)
@@ -302,8 +505,7 @@ def do_sign_rule(args):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     try:
-        key = serialization.load_pem_private_key(
-            open(args.keyfile, "rb").read(), password=None)
+        key = load_private_key(args.keyfile)
         print(f"[mock] loaded key {args.keyfile}")
     except Exception:
         key = Ed25519PrivateKey.generate()
@@ -316,12 +518,13 @@ def do_sign_rule(args):
         print(f"[mock] SPKI b64(pubkey)="
               f"{b64(key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo))}")
 
-    if not args.rule:
+    if not args.rule and args.upgrade_type == 1:
         args.rule = ['alert tcp any any -> any 3389 (msg:"RDP"; sid:10001;)']
     target = {"ecu": args.ecu, "nodeType": args.node_type, "vmodel": args.vmodel}
     bundle, canonical = sign_rule_bundle(
         key, seq=args.seq, tenant=args.tenant, version=args.version,
-        rollback=args.rollback, target=target, upgrade_type=1, rules=args.rule)
+        rollback=args.rollback, target=target, upgrade_type=args.upgrade_type,
+        rules=args.rule, download_uri=args.download_uri)
 
     done = threading.Event()
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -329,7 +532,59 @@ def do_sign_rule(args):
     def on_connect(client, _ud, _flags, rc, _props=None):
         topic = f"oc/devices/{args.device}/sys/idps/rule/update"
         client.publish(topic, json.dumps(bundle), qos=1, retain=True)
-        print(f"[mock] signed rule v{args.version} seq={args.seq} -> {topic}")
+        print(f"[mock] signed rule v{args.version} seq={args.seq} "
+              f"upgrade_type={args.upgrade_type} -> {topic}")
+        done.set()
+
+    c.on_connect = on_connect
+    c.connect(BROKER_HOST, BROKER_PORT, 60)
+    c.loop_start()
+    done.wait(10)
+    c.loop_stop()
+    print("[mock] canonical preview:")
+    print(canonical.decode(), end="")
+    return 0
+
+
+def do_sign_config(args):
+    import paho.mqtt.client as mqtt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    try:
+        key = load_private_key(args.keyfile)
+        print(f"[mock] loaded key {args.keyfile}")
+    except Exception:
+        key = Ed25519PrivateKey.generate()
+        pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption())
+        open(args.keyfile, "wb").write(pem)
+        print(f"[mock] generated key -> {args.keyfile}")
+        print(f"[mock] SPKI b64(pubkey)="
+              f"{b64(key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo))}")
+
+    items = [json.loads(s) for s in args.item] or [
+        {"config_name": "process_w_list",
+         "config_value": ["/usr/sbin/sshd", "/usr/bin/crond"],
+         "config_version": "c1"}]
+    tuples = [(it["config_name"], it["config_value"], it["config_version"])
+              for it in items]
+    target = {"ecu": args.ecu, "nodeType": args.node_type, "vmodel": args.vmodel}
+    bundle, canonical = sign_config_bundle(
+        key, seq=args.seq, tenant=args.tenant, version=args.version,
+        rollback=args.rollback, target=target, config_type=args.config_type,
+        items=tuples)
+
+    done = threading.Event()
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+    def on_connect(client, _ud, _flags, rc, _props=None):
+        topic = f"oc/devices/{args.device}/sys/idps/config/update"
+        client.publish(topic, json.dumps(bundle), qos=1, retain=True)
+        print(f"[mock] signed config v{args.version} seq={args.seq} "
+              f"type={args.config_type} -> {topic}")
         done.set()
 
     c.on_connect = on_connect

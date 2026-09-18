@@ -12,7 +12,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mock_vsoc import sign_rule_bundle  # noqa: E402
+from mock_vsoc import sign_rule_bundle, sign_config_bundle  # noqa: E402
 
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
@@ -37,6 +37,14 @@ def main():
         "bundle": bundle,
         "canonical": canonical.decode("utf-8"),
     }
+    # 配置包互操作向量(10.3): 与规则包共用签名 key/序号种子无关
+    citems = [("app_w_list", ["/usr/sbin/sshd", "/usr/bin/crond"], "c1"),
+              ("fw_ip_b_list", ["10.0.0.66"], "c2")]
+    cbundle, ccanonical = sign_config_bundle(
+        key, seq=7, tenant="caic", version="c1", rollback=False,
+        target=target, config_type=1, items=citems)
+    vec["config_bundle"] = cbundle
+    vec["config_canonical"] = ccanonical.decode("utf-8")
     with open(out_path, "w") as f:
         json.dump(vec, f, indent=1)
     print(f"[vector] {out_path}")
