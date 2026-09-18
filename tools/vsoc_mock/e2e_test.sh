@@ -20,6 +20,8 @@ MOCK_PID=$!
 ./build/linux/idsm_managerd/idsm_managerd --no-tls \
     --broker 127.0.0.1:18883 \
     --device-id caic_t99_LXXXXXXX202000001 \
+    --vin LXXXXXXX202000001 \
+    --register \
     --ecu-code 0x01 \
     --data-dir "$D" --rules-dir "$D/rules" --seed-dir "$D/seed" \
     --socket "$D/host.sock" > "$D/managerd.log" 2>&1 &
@@ -49,4 +51,5 @@ echo "==================== managerd ===================="
 tail -40 "$D/managerd.log"
 echo "==================== probe ===================="
 tail -10 "$D/probe.log"
+echo "[e2e] credentials: $(test -f "$D/credentials.json" && echo SAVED || echo MISSING)"
 echo "[e2e] logs kept in $D"

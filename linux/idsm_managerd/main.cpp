@@ -16,18 +16,23 @@
  */
 #include "alert_queue.h"
 #include "mqtt_uploader.h"
+#include "property_report.h"
+#include "registration.h"
 #include "rule_manager.h"
 #include "socket_server.h"
 #include "vsoc_envelope.h"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <list>
 #include <map>
@@ -61,6 +66,7 @@ struct Args {
     std::string pubkey_b64;
     std::string reload_cmd;
     std::string ecu_code{"0x00"};
+    bool        registration{false};   /* --register: 一型一证 init 流程 */
     bool        tls{true};
     unsigned    socket_perm{0660};
 };
@@ -82,6 +88,8 @@ void usage(const char* argv0) {
         "  --broker HOST:PORT   MQTT broker(默认 localhost:8883)\n"
         "  --no-tls             实验室明文 tcp(mock 云)\n"
         "  --token TOKEN        短期令牌\n"
+        "  --register           走一型一证 init 流程(无 --token 且\n"
+        "                       无本地凭据时向注册服务换 clientId+token)\n"
         "  --cafile FILE        TLS CA\n"
         "  --pubkey-b64 B64     规则签名 Ed25519 公钥(SPKI base64)\n"
         "  --reload-cmd CMD     规则切换后执行(如 systemctl restart ...)\n"
@@ -125,6 +133,7 @@ bool parseArgs(int argc, char** argv, Args& a) {
         else if (k == "--cafile")     a.cafile = next(k.c_str());
         else if (k == "--pubkey-b64") a.pubkey_b64 = next(k.c_str());
         else if (k == "--reload-cmd") a.reload_cmd = next(k.c_str());
+        else if (k == "--register")   a.registration = true;
         else if (k == "--no-tls")     a.tls = false;
         else if (k == "--socket-perm")
             a.socket_perm = static_cast<unsigned>(
@@ -232,10 +241,78 @@ int main(int argc, char** argv) {
     self_id.vmodel = args.model_code;
     for (const auto& ch : channels) self_id.node_types.push_back(ch.node_type);
 
+    /* LWT(5.3): 属性同通道, nodeStatus=0 单节点(管理组件宿主节点) */
+    {
+        idsm::NodeProperty down_node;
+        down_node.ecu_code = args.ecu_code;
+        down_node.node_type =
+            channels.empty() ? "HIDPS" : channels.front().node_type;
+        for (const auto& ch : channels)
+            if (ch.node_type == "HIDPS") down_node.node_type = "HIDPS";
+        down_node.node_status = 0;
+        down_node.node_version = "idsm_managerd/1.0.0";
+        down_node.rule_version = "unknown";
+        mcfg.will_topic = idsm::propertyTopic(args.device_id);
+        mcfg.will_payload = idsm::buildPropertyReport(
+            args.manufacturer, {down_node},
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    /* 凭据: --token 直给 > 本地凭据文件; --register 且无有效凭据时
+     * 走一型一证 init 流程换 clientId+token(4.2) */
+    enum class RegState { Disabled, NeedRegister, Waiting, Registered };
+    struct RegContext {
+        RegState state{RegState::Disabled};
+        idsm::Credentials creds;
+        idsm::Credentials pending;      /* 响应回调解析结果 */
+        std::atomic<bool> response_ready{false};
+        std::string request_id;
+        std::string err;
+    } reg;
+    idsm::CredentialStore cred_store(args.data_dir + "/credentials.json");
+    long long reg_deadline_ms = 0;
+    long long reg_next_attempt_ms = 0;
+    int reg_attempts = 0;
+    const std::string reg_req_topic_base =
+        "oc/devices/" + args.device_id + "/sys/init/request/rid=";
+    if (!args.token.empty()) {
+        reg.creds.client_id = "idsm-" + args.device_id;
+        reg.creds.token = args.token;
+        reg.state = RegState::Registered;
+    } else {
+        std::string ce;
+        if (cred_store.load(reg.creds, ce) && !ce.empty()) {
+            std::fprintf(stderr, "[IDSMD] credentials unreadable, re-register\n");
+            reg.creds = idsm::Credentials{};
+        }
+        const long long now_sec = std::time(nullptr);
+        if (reg.creds.validAt(now_sec)) {
+            reg.state = RegState::Registered;
+            std::fprintf(stderr, "[IDSMD] loaded credentials for %s\n",
+                         reg.creds.client_id.c_str());
+        } else if (args.registration) {
+            reg.state = RegState::NeedRegister;
+        }
+    }
+    if (reg.state == RegState::Registered) {
+        mcfg.client_id = reg.creds.client_id;
+        mcfg.token = reg.creds.token;
+    }
+
     auto uploader = idsm::MqttUploader::create(mcfg);
     if (!uploader->start(
-            [&rules, self_id](const std::string&, const std::string& payload) {
+            [&rules, self_id, &reg](const std::string& topic,
+                                    const std::string& payload) {
                 std::string e;
+                if (topic.find("/sys/init/response/") != std::string::npos) {
+                    /* 注册响应(4.3): 网络线程只解析, 主循环落盘+重连 */
+                    if (idsm::parseInitResponse(payload, reg.request_id,
+                                                reg.pending, e)) {
+                        reg.response_ready.store(true);
+                    }
+                    return;
+                }
                 const auto r = rules.applyBundle(payload, self_id, e);
                 if (r == idsm::RuleApply::Rejected) {
                     std::fprintf(stderr, "[IDSMD] rule bundle rejected: %s\n",
@@ -270,10 +347,100 @@ int main(int argc, char** argv) {
                  args.device_id.c_str(), args.ecu_code.c_str(),
                  mcfg.host.c_str(), mcfg.port, static_cast<int>(mcfg.tls));
 
+    std::srand(static_cast<unsigned>(std::time(nullptr)) ^ ::getpid());
+    long long next_report_ms = 0;   /* 属性/心跳定时 */
+
     /* 上报循环: 逐通道 pending -> 信封 -> 分管道发布 -> 推进游标 */
     while (g_running.load()) {
         bool any = false;
         const std::string rule_ver = currentRuleVersion(args.rules_dir);
+        const long long now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+        /* 注册响应落盘 + 热更新凭据触发重连(4.3/4.4) */
+        if (reg.response_ready.exchange(false)) {
+            std::string e;
+            if (cred_store.save(reg.pending, e) &&
+                uploader->updateCredentials(reg.pending.client_id,
+                                            reg.pending.token, e)) {
+                reg.creds = reg.pending;
+                reg.state = RegState::Registered;
+                next_report_ms = now_ms + 5000;   /* 重连后 5s 内全量(8.3) */
+                std::fprintf(stderr, "[IDSMD] registered: client_id=%s\n",
+                             reg.creds.client_id.c_str());
+            } else {
+                reg.state = RegState::NeedRegister;
+                reg_next_attempt_ms = now_ms + 10000;
+                std::fprintf(stderr, "[IDSMD] credential apply failed: %s\n",
+                             e.c_str());
+            }
+            reg.pending = idsm::Credentials{};
+        }
+
+        /* 注册状态机(4.2): 指数退避重试, 响应 30s 超时 */
+        if (reg.state == RegState::NeedRegister && uploader->connected() &&
+            now_ms >= reg_next_attempt_ms) {
+            reg.request_id = idsm::newRequestId();
+            std::string e;
+            const std::string req = idsm::buildInitRequest(
+                args.manufacturer, reg.request_id, now_ms, args.vin,
+                args.model_code, {args.ecu_code});
+            /* rid={request_id} 为键值型单段, MQTT 不允许嵌入式 +
+             * 通配(7 章"rid=+"写法不成立), 按自己的 request_id 精确订阅 */
+            const std::string resp_topic =
+                "oc/devices/" + args.device_id + "/sys/init/response/rid=" +
+                reg.request_id;
+            if (uploader->subscribe(resp_topic, e) &&
+                uploader->publish(reg_req_topic_base + reg.request_id,
+                                  req, e)) {
+                reg.state = RegState::Waiting;
+                reg_deadline_ms = now_ms + 30000;
+                ++reg_attempts;
+                std::fprintf(stderr, "[IDSMD] init request rid=%s (attempt %d)\n",
+                             reg.request_id.c_str(), reg_attempts);
+            } else {
+                reg_next_attempt_ms = now_ms + 10000;
+            }
+        } else if (reg.state == RegState::Waiting &&
+                   now_ms > reg_deadline_ms) {
+            reg.state = RegState::NeedRegister;
+            const long long backoff =
+                std::min<long long>(60000, 5000LL * (reg_attempts + 1));
+            reg_next_attempt_ms = now_ms + backoff;
+            std::fprintf(stderr, "[IDSMD] init timeout, retry in %llds\n",
+                         backoff / 1000);
+        }
+
+        /* 属性/心跳(8.3): CONNECT 后 5s 内全量 + 300s±10% 周期;
+         * 未注册(NeedRegister/Waiting)时不发, 真实 broker 会拒 */
+        if (uploader->connected() &&
+            (reg.state == RegState::Registered ||
+             reg.state == RegState::Disabled) &&
+            now_ms >= next_report_ms) {
+            std::vector<idsm::NodeProperty> nodes;
+            for (const auto& ch : channels) {
+                idsm::NodeProperty n;
+                n.ecu_code = args.ecu_code;
+                n.node_type = ch.node_type;
+                n.node_version = "idsm_managerd/1.0.0";
+                n.node_status = 1;
+                n.rule_version = rule_ver;
+                nodes.push_back(std::move(n));
+            }
+            std::string e;
+            if (uploader->publish(idsm::propertyTopic(args.device_id),
+                                  idsm::buildPropertyReport(
+                                      args.manufacturer, nodes, now_ms), e)) {
+                next_report_ms = idsm::nextReportTimeMs(
+                    now_ms, static_cast<unsigned>(std::rand()));
+                std::fprintf(stderr, "[IDSMD] property report (%zu nodes)\n",
+                             nodes.size());
+            } else {
+                next_report_ms = now_ms + 10000;   /* 发布失败稍后重试 */
+            }
+        }
+
         for (auto& ch : channels) {
             auto batch = ch.queue.pending(64);
             if (batch.empty()) continue;

@@ -21,10 +21,13 @@ struct MqttConfig {
     std::string device_id{"UNKNOWN"};
     std::string manufacturer{"caic"};
     std::string model_code{"t99"};
+    std::string client_id;  /* 空 = "idsm-"+device_id; 注册后更新 */
     std::string token;      /* 短期令牌, 连接时刷新 */
     bool        tls{true};  /* false = 实验室 tcp:// 明文(mock 云) */
     std::string cafile;     /* CA 或自签校验; pinning 见 mosquitto 实现的
                                mosquitto_tls_set 注释 */
+    std::string will_topic;     /* LWT(5.3), 空 = 不带遗嘱 */
+    std::string will_payload;   /* nodeStatus=0 单节点属性信封 */
     int         timeout_ms{10000};
 };
 
@@ -43,6 +46,15 @@ public:
     /* QoS1 发布到任意 topic(VSOC 信封/属性/事件); 成功返回 true */
     virtual bool publish(const std::string& topic, const std::string& payload,
                          std::string& err) = 0;
+
+    /* 注册成功后热更新凭据(username=clientId)并触发重连;
+     * 空 token 保持匿名(未注册/一机一证直连由调用方决定) */
+    virtual bool updateCredentials(const std::string& client_id,
+                                   const std::string& token,
+                                   std::string& err) = 0;
+
+    /* 订阅任意 topic(如按 request_id 精确订阅注册响应, 7 章) */
+    virtual bool subscribe(const std::string& topic, std::string& err) = 0;
 
     static std::unique_ptr<MqttUploader> create(const MqttConfig& cfg);
 

@@ -131,6 +131,7 @@ def start_paho_services(expect_alerts, alert_min, stop_evt):
         print("[mock] services online", flush=True)
         client.subscribe("oc/devices/+/sys/init/request/+")
         client.subscribe("oc/devices/+/sys/cert/request/+")
+        client.subscribe("oc/devices/+/sys/property/report")
         if expect_alerts:
             for seg in ("host", "eth", "can"):
                 client.subscribe(f"oc/devices/+/sys/idps/{seg}/log")
@@ -174,6 +175,13 @@ def start_paho_services(expect_alerts, alert_min, stop_evt):
             else:
                 stats["bad"].append((topic, why))
                 print(f"[mock] BAD alert envelope: {why}", flush=True)
+        elif topic.endswith("/sys/property/report"):
+            nodes = payload.get("content", [])
+            stats["properties"] = stats.get("properties", 0) + 1
+            desc = ",".join(
+                f"{n.get('nodeType')}:{'on' if n.get('nodeStatus') == 1 else 'off'}"
+                f"/rv={n.get('ruleVersion')}" for n in nodes)
+            print(f"[mock] property from {did}: {desc}", flush=True)
 
     c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     c.on_connect = on_connect
@@ -231,6 +239,15 @@ def validate_alert_envelope(env, seg):
 async def run_broker(stop_evt):
     broker = Broker(BROKER_CONFIG)
     await broker.start()
+    # amqtt 认证语义:任一认证插件返回 False 即拒绝。auth_file 无
+    # password_file 时对一切带用户名的连接返回 False, 会拒绝注册后
+    # 凭 token 重连的车端。mock 云等价于真实云"令牌校验通过":
+    # 把 auth_file 打补丁为恒真(匿名本来就由 auth_anonymous 放行)。
+    async def _accept_any(*_a, **_k):
+        return True
+    for p in broker.plugins_manager._plugins:
+        if p.name == "auth_file":
+            p.object.authenticate = _accept_any
     print(f"[mock] broker listening {BROKER_HOST}:{BROKER_PORT}", flush=True)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, stop_evt.wait)

@@ -411,7 +411,12 @@ v0.7 附录"在线(如何实现)"就此定稿。
 | 孪生 CAN | `sim/devices/{device_id}/idps/candata` | sim/attacker | 检测引擎 | 数采/攻击注入报文 |
 
 订阅通配规则:车端订阅 own 前缀用具体 topic;平台服务可用 `+`;
-`{request_id}` 段订阅必须用 `rid=+` 单段通配,**禁止 `#` 全局通配**。
+**禁止 `#` 全局通配**。`rid={request_id}` 是键值型单段,`rid=+` 属
+段内嵌通配符,MQTT 协议非法(libmosquitto 直接 INVAL 拒绝);正确姿势:
+车端按自己刚发出的 request_id **精确订阅**响应 topic
+(`.../sys/init/response/rid={request_id}`,一次请求一订阅,重试换新
+rid 再订阅);平台服务收请求用 `oc/devices/+/sys/init/request/+`
+(此时 `+` 为整段通配,合法)。
 (v0.7 的 `request_id=` 段名由兼容层保留一年,新实现一律 `rid=`)
 
 ---
@@ -779,17 +784,23 @@ topic:`oc/devices/{device_id}/sys/log/report`,QoS 1。
 
 | 本文档 | 仓库实现 | 状态 |
 |---|---|---|
-| 管理组件(2.1) | `linux/idsm_managerd/`、`android/idsm_manager/` | 已有,待按本文 topic/信封适配 |
+| 管理组件(2.1) | `linux/idsm_managerd/`、`android/idsm_manager/` | **已按本文对齐**:分通道 UDS、v1.0 信封上云;E2E(mock_vsoc)PASS |
 | 三探针(9 章) | `apps/host_probe`(HIDPS)、`apps/eth_probe`(NIDPS)、`apps/can_probe`(CIDS) | 已有,UDS sink 就绪 |
-| 持久队列(9.3) | JSONL+游标(Linux)/ SQLite(APK) | 已有 |
-| 规则验签切换(10.4) | `rule_manager`(OpenSSL EVP/BC Ed25519,canonical 与 10.1 一致) | 已有,需扩展 seq/rollback/target 字段 |
-| 注册状态机(4 章) | managerd/APK 尚无,**待开发** | 缺口 |
-| 属性/心跳上报(8 章) | 尚无,**待开发**(探针定期输出状态经管理组件上报) | 缺口 |
+| 持久队列(9.3) | JSONL+游标(Linux)/ SQLite v2 带 node_type/raw(APK) | 已有 |
+| 规则验签切换(10.4) | `rule_manager`(Linux C++) / `RuleManager.kt`(APK):Ed25519 验签 + 10.1 canonical 与 `mock_vsoc.py` 逐字节一致、seq 防回滚、±24h 时效、target 过滤;python 签名互操作向量进 ctest | **已完成** |
+| 注册状态机(4 章) | managerd `registration.cpp`(--register 一型一证 init,凭据落盘轮换)/ APK `Registration.kt`(persist.idsm.register 开关) | **已完成**(sys/cert 通道归 PKI,mock 返 1004) |
+| 属性/心跳上报(8 章) | 两侧均已实现:CONNECT 后 5s 全量 + 300s±10% 周期 + LWT(5.3) | **已完成** |
+| LWT 在线语义(5.3) | mosquitto will_set / paho setWill,属性同通道 nodeStatus=0 | **已完成** |
 | ACL 矩阵(3.5) | EMQX 配置,平台侧 | 待部署 |
 | 快照分包(11 章) | 尚无 | 缺口,低优先 |
 
-适配优先级:P0 = topic 映射 + device_id 三段式 + 信封统一;P1 = 属性上报、
-注册状态机、策略包 seq/防回滚扩展;P2 = 快照分包、孪生隔离。
+适配优先级:P0 = topic 映射 + device_id 三段式 + 信封统一(**已完成**);
+P1 = 属性上报、注册状态机、策略包 seq/防回滚扩展(**已完成**);
+P2 = 快照分包、孪生隔离。
+
+> 注:7 章"rid=+ 单段通配"在实现中勘正——`rid={request_id}` 为键值型
+> 单段,段内嵌 `+` 属 MQTT 非法;车端按自己发出的 request_id 精确订阅
+> 响应 topic(正文 7 章已修订)。
 
 ---
 

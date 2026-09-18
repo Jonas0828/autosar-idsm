@@ -5,6 +5,8 @@ add_library(idsm_managerd_lib STATIC
     alert_queue.cpp
     socket_server.cpp
     mqtt_uploader.cpp
+    property_report.cpp
+    registration.cpp
     rule_manager.cpp
     vsoc_envelope.cpp
 )

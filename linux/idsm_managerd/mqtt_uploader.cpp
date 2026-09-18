@@ -27,14 +27,21 @@ public:
 
     bool start(DownlinkCallback cb, std::string& err) override {
         m_downlink = std::move(cb);
+        if (m_cfg.client_id.empty()) m_cfg.client_id = "idsm-" + m_cfg.device_id;
         mosquitto_connect_callback_set(m_mosq, onConnect);
         mosquitto_disconnect_callback_set(m_mosq, onDisconnect);
         mosquitto_message_callback_set(m_mosq, onMessage);
         mosquitto_log_callback_set(m_mosq, onLog);
+        if (!m_cfg.will_topic.empty()) {
+            /* LWT(5.3): 属性同通道, nodeStatus=0 单节点, QoS1 retain false */
+            mosquitto_will_set(m_mosq, m_cfg.will_topic.c_str(),
+                               static_cast<int>(m_cfg.will_payload.size()),
+                               m_cfg.will_payload.data(), 1, false);
+        }
         /* 未拿到注册令牌前保持匿名 CONNECT;带用户名但密码为空会被
            认证插件(如 amqtt auth_file)直接拒绝 */
         if (!m_cfg.token.empty()) {
-            mosquitto_username_pw_set(m_mosq, ("idsm-" + m_cfg.device_id).c_str(),
+            mosquitto_username_pw_set(m_mosq, m_cfg.client_id.c_str(),
                                       m_cfg.token.c_str());
         }
         if (m_cfg.tls && !m_cfg.cafile.empty()) {
@@ -84,6 +91,43 @@ public:
             payload.data(), 1, false);
         if (rc != MOSQ_ERR_SUCCESS) {
             err = "publish: " + std::string(mosquitto_strerror(rc));
+            return false;
+        }
+        return true;
+    }
+
+    bool updateCredentials(const std::string& client_id,
+                           const std::string& token,
+                           std::string& err) override {
+        m_cfg.client_id = client_id;
+        m_cfg.token = token;
+        if (token.empty()) {
+            /* 匿名重连: 清掉旧用户名, 否则重连仍带老凭据 */
+            mosquitto_username_pw_set(m_mosq, nullptr, nullptr);
+        } else {
+            mosquitto_username_pw_set(m_mosq, client_id.c_str(), token.c_str());
+        }
+        if (m_connected) {
+            /* 手动 disconnect 不会自动重连, 必须显式 reconnect_async;
+             * loop 线程执行断开+重连, 新凭据生效。
+             * 注意: 非优雅断开会让 broker 代发一次 LWT(短暂离线假象),
+             * reconnect 后 5s 内的全量属性上报(8.3)会恢复在线语义;
+             * 不用 mosquitto_disconnect 是因为它非线程安全(loop 线程
+             * 运行中从业务线程调用有竞态)。 */
+            const int rc = mosquitto_reconnect_async(m_mosq);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                err = "reconnect for credential refresh: " +
+                      std::string(mosquitto_strerror(rc));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool subscribe(const std::string& topic, std::string& err) override {
+        const int rc = mosquitto_subscribe(m_mosq, nullptr, topic.c_str(), 1);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            err = "subscribe: " + std::string(mosquitto_strerror(rc));
             return false;
         }
         return true;
@@ -143,6 +187,19 @@ public:
                  std::string&) override {
         std::fprintf(stderr, "[IDSMD] STUB publish %zu bytes to %s\n",
                      payload.size(), topic.c_str());
+        return true;
+    }
+    bool updateCredentials(const std::string& client_id,
+                           const std::string& token,
+                           std::string&) override {
+        m_cfg.client_id = client_id;
+        m_cfg.token = token;
+        std::fprintf(stderr, "[IDSMD] STUB credentials -> %s\n",
+                     client_id.c_str());
+        return true;
+    }
+    bool subscribe(const std::string& topic, std::string&) override {
+        std::fprintf(stderr, "[IDSMD] STUB subscribe %s\n", topic.c_str());
         return true;
     }
 private:

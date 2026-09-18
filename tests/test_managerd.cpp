@@ -27,6 +27,8 @@
 
 #include "alert_queue.h"
 #include "base64.h"
+#include "property_report.h"
+#include "registration.h"
 #include "rule_manager.h"
 #include "socket_server.h"
 #include "vsoc_envelope.h"
@@ -365,6 +367,128 @@ TEST(ManagerdRulesInterop, PythonSignedBundleApplies) {
 }
 
 /* ─────────────────────── UDS 收包 ─────────────────────────── */
+
+/* ─────────── 一型一证注册(4 章) + 属性/心跳(8 章) ─────────── */
+
+TEST(ManagerdRegistration, CredentialStoreRoundTrip) {
+    const auto dir = tmpDir("credstore");
+    const auto path = (fs::path(dir) / "credentials.json").string();
+    idsm::CredentialStore store(path);
+    std::string err;
+
+    /* 不存在: false 且 err 为空 */
+    idsm::Credentials out;
+    EXPECT_FALSE(store.load(out, err));
+    EXPECT_TRUE(err.empty());
+
+    /* 保存 -> 读回 */
+    idsm::Credentials in;
+    in.client_id = "vehicle_t99_abcdef0123456789";
+    in.token = "tok-123";
+    in.token_expire = 1893456000;
+    ASSERT_TRUE(store.save(in, err)) << err;
+    ASSERT_TRUE(store.load(out, err)) << err;
+    EXPECT_EQ(out.client_id, in.client_id);
+    EXPECT_EQ(out.token, in.token);
+    EXPECT_EQ(out.token_expire, in.token_expire);
+    EXPECT_TRUE(out.validAt(1700000000));
+    EXPECT_FALSE(out.validAt(1893456000 + 1));   /* 过期 */
+
+    /* 损坏文件 -> false + err */
+    {
+        std::ofstream os(path, std::ios::trunc);
+        os << "not-json{";
+    }
+    EXPECT_FALSE(store.load(out, err));
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(ManagerdRegistration, RequestIdIsUuidV4) {
+    const auto id = idsm::newRequestId();
+    ASSERT_EQ(id.size(), 36u);
+    EXPECT_EQ(id[8], '-');
+    EXPECT_EQ(id[13], '-');
+    EXPECT_EQ(id[14], '4');       /* version 4 */
+    EXPECT_EQ(id[18], '-');
+    EXPECT_TRUE(id[19] == '8' || id[19] == '9' ||
+                id[19] == 'a' || id[19] == 'b');   /* variant 10xx */
+}
+
+TEST(ManagerdRegistration, BuildInitRequestMatchesSpec) {
+    const auto req = nlohmann::json::parse(idsm::buildInitRequest(
+        "caic", "rid-001", 1726640000000LL, "LXXXXXXX202000001", "t99",
+        {"0x01", "0x02"}));
+    EXPECT_EQ(req["request_id"], "rid-001");
+    EXPECT_EQ(req["timestamp"], 1726640000000LL);
+    EXPECT_EQ(req["manufacturer"], "caic");
+    EXPECT_EQ(req["type"], 1);
+    EXPECT_EQ(req["content"]["vin"], "LXXXXXXX202000001");
+    EXPECT_EQ(req["content"]["modelId"], "t99");
+    ASSERT_TRUE(req["content"]["ecuList"].is_array());
+    EXPECT_EQ(req["content"]["ecuList"].size(), 2u);
+}
+
+TEST(ManagerdRegistration, ParseInitResponse) {
+    nlohmann::json resp;
+    resp["rc"] = 0;
+    resp["rn"] = "register_response";
+    resp["request_id"] = "b7d2f1a0-3c4e-4a2b-9d1f-2e8a6b0c4d5f";
+    resp["timestamp"] = 1726640000000LL;
+    resp["paras"] = {{"msg", "注册成功"},
+                     {"client_id", "vehicle_t99_AbCdEf1234567890"},
+                     {"token", "jwt-example"},
+                     {"token_expire", 1726647200}};
+    idsm::Credentials got;
+    std::string err;
+    ASSERT_TRUE(idsm::parseInitResponse(
+        resp.dump(), "b7d2f1a0-3c4e-4a2b-9d1f-2e8a6b0c4d5f", got, err)) << err;
+    EXPECT_EQ(got.client_id, "vehicle_t99_AbCdEf1234567890");
+    EXPECT_EQ(got.token, "jwt-example");
+    EXPECT_EQ(got.token_expire, 1726647200);
+
+    /* request_id 不匹配 -> 拒绝 */
+    EXPECT_FALSE(idsm::parseInitResponse(resp.dump(), "other-rid", got, err));
+    /* rc != 0 -> 拒绝 */
+    resp["rc"] = 1002;
+    EXPECT_FALSE(idsm::parseInitResponse(resp.dump(),
+                                         "b7d2f1a0-3c4e-4a2b-9d1f-2e8a6b0c4d5f",
+                                         got, err));
+}
+
+TEST(ManagerdProperty, BuildsEnvelopeAndSchedulesHeartbeat) {
+    idsm::NodeProperty n;
+    n.ecu_code = "0x01";
+    n.node_type = "HIDPS";
+    n.node_version = "idsm_managerd/1.0.0";
+    n.node_status = 1;
+    n.rule_version = "v0";
+    const auto env = nlohmann::json::parse(
+        idsm::buildPropertyReport("caic", {n}, 1726640000000LL));
+    EXPECT_EQ(env["msg_type"], "property");
+    EXPECT_EQ(env["protocol_version"], "1.0");
+    EXPECT_EQ(env["timestamp"], 1726640000000LL);
+    EXPECT_EQ(env["manufacturer"], "caic");
+    ASSERT_TRUE(env["content"].is_array());
+    ASSERT_EQ(env["content"].size(), 1u);
+    const auto& c = env["content"][0];
+    EXPECT_EQ(c["ecuCode"], "0x01");
+    EXPECT_EQ(c["ecuOs"], "Linux");
+    EXPECT_EQ(c["nodeType"], "HIDPS");
+    EXPECT_EQ(c["nodeStatus"], 1);
+    EXPECT_EQ(c["ruleVersion"], "v0");
+    EXPECT_EQ(c["nodeVersion"], "idsm_managerd/1.0.0");
+
+    /* 心跳周期 300s ± 10% */
+    for (unsigned jitter : {0u, 12345u, 59999u}) {
+        const auto next = idsm::nextReportTimeMs(1000000LL, jitter);
+        EXPECT_GE(next - 1000000LL, 270000LL);
+        EXPECT_LE(next - 1000000LL, 330000LL);
+    }
+
+    /* LWT 主题与属性上报同通道(5.3) */
+    EXPECT_EQ(idsm::propertyTopic("caic_t99_vin"),
+              "oc/devices/caic_t99_vin/sys/property/report");
+}
 
 TEST(ManagerdSocket, ReceivesNdjsonLines) {
     const auto dir = tmpDir("sock");

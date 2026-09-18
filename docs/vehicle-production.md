@@ -18,12 +18,13 @@
 ┌────────────────────────────────────────────────────┐
 │ 云端: MQTT broker + 规则签名服务 + 告警存储/分析      │
 └──────────────▲───────────────────────┬─────────────┘
-               │ MQTT/TLS (pinning,    │ ids/rules/{vin}
-               │ QoS1, 短时令牌)        │ Ed25519 签名规则包
+               │ MQTT/TLS (pinning,    │ oc/devices/{id}/sys/idps/rule/update
+               │ QoS1, 令牌/注册)       │ + vmodel 广播, Ed25519 签名(v1.0 10.2)
 ┌──────────────┴───────────────────────▼─────────────┐
 │ IdsmManager APK(平台签名/persistent,独立 sepolicy 域)│
-│  ProbeSocketServer ← UDS abstract "idsm_probe"      │
-│  AlertQueue(SQLite)  MqttUploader  RuleManager      │
+│  ProbeSocketServer ← UDS abstract idsm_host/eth/can │
+│  AlertQueue(SQLite v2)  VsocEnvelope  MqttUploader  │
+│  Registration(4 章)  PropertyReport(8 章)  Rules    │
 └───────▲─────────────────────────────┬──────────────┘
         │ NDJSON (fire-and-forget)    │ 规则: files/current
 ┌───────┴──────────┐         ┌────────┴─────────────┐
@@ -39,11 +40,13 @@
 ┌────────────────────────────────────────────────────┐
 │ 云端: MQTT broker + 规则签名服务 + 告警存储/分析      │
 └──────────────▲───────────────────────┬─────────────┘
-               │ ids/alerts/{vin} QoS1 │ ids/rules/{vin}
+               │ oc/devices/{device_id}/sys/idps/{host|eth|can}/log QoS1
+               │ + sys/property/report │ oc/devices/{device_id}/sys/idps/rule/update
 ┌──────────────┴───────────────────────▼─────────────┐
 │ idsm_managerd(systemd 拉起, 普通用户, 64M 内存兜底)  │
-│  SocketServer ← UDS /run/idsm/probe.sock           │
-│  AlertQueue(JSONL+游标)  MqttUploader  RuleManager  │
+│  SocketServer ← UDS /run/idsm/host.sock + --sink NIDPS/CIDS │
+│  AlertQueue(JSONL+游标)  VsocEnvelope  MqttUploader │
+│  Registration(--register)  PropertyReport  Rules    │
 └───────▲─────────────────────────────┬──────────────┘
         │ NDJSON (fire-and-forget)    │ rules/current
 ┌───────┴──────────┐         ┌────────┴─────────────┐
@@ -64,10 +67,13 @@
 
 ### 告警上报(至少一次)
 1. 探针检测合格事件 → IdsRM 双发:HTTP 路径关闭时只走 sink;
-2. sink 线程连接 `@idsm_probe` 发 NDJSON 行,断连退避重连,
+2. sink 线程连接本 nodeType 通道(@idsm_host/@idsm_eth 或
+   /run/idsm/host.sock 等)发 NDJSON 行,断连退避重连,
    队列上限 512,溢出丢弃并计数(探针日志可见);
-3. APK 收行即落 SQLite(uploaded=0);
-4. MqttUploader 批量取 64 条 → QoS1 publish → broker ack → markUploaded;
+3. APK 收行即落 SQLite v2(node_type + raw,uploaded=0);
+4. MqttUploader 按 nodeType 批量取 64 条 → VsocEnvelope 构造
+   alert_{host|eth|can} 信封(6/9 章)→ QoS1 publish → broker ack
+   → markUploaded;
 5. APK 被杀/断网/断电恢复后从 uploaded=0 续传。
 
 ### 规则下发(可信通道)
@@ -101,7 +107,7 @@
 
 1. 台架/HIL:继续用 `--soc http://<server>:9000` 本地栈,攻击用例见
    `attack-testing-guide.md`;
-2. 车机 bring-up:`--sink @idsm_probe` + IdsmManager(debug 签名,
+2. 车机 bring-up:`--sink @idsm_host`(eth_probe 用 `@idsm_eth`)+ IdsmManager(debug 签名,
    userdebug 镜像),MQTT broker 先指向内网;
 3. Linux 网关 bring-up:`linux/systemd/*.service` 安装 + stub MQTT 验证链路,
    再装 `libmosquitto-dev` 重新 cmake 启用真实上云;
