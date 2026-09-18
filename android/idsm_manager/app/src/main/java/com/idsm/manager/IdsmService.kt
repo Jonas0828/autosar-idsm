@@ -3,22 +3,22 @@ package com.idsm.manager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 
 /**
- * IdsmService -- 车规管理核心服务。
+ * IdsmService -- 车规管理核心服务(VSOC 设备接入设计 v1.0 车端落地,
+ * 与 linux/idsm_managerd 同协议)。
  *
  * 生命周期: init 拉起(见 vendor .rc 中 APK 由 persistent 属性保证常驻),
  * BOOT_COMPLETED 兜底。持有四个协作组件:
- *  - [ProbeSocketServer] 收探针告警(UDS abstract @idsm_probe)
- *  - [AlertQueue]        SQLite 持久队列,APK 被杀也不丢
- *  - [MqttUploader]      MQTT/TLS 上云,证书 pinning + 短时令牌
- *  - [RuleManager]       云端规则包验签、原子切换、回滚
+ *  - [ProbeSocketServer] 分通道收探针告警(abstract @idsm_host/eth/can)
+ *  - [AlertQueue]        SQLite 持久队列, APK 被杀也不丢
+ *  - [MqttUploader]      MQTT 上云: alert 信封/属性心跳/LWT/注册/规则订阅
+ *  - [RuleManager]       云端签名规则包验签(v1.0 10.1/10.2)、防回滚、分发
  *
- * native 探针不直接碰网络/云,所有云端交互集中在本服务,便于安全审计。
+ * native 探针不直接碰网络/云, 所有云端交互集中在本服务, 便于安全审计。
  */
 class IdsmService : Service() {
 
@@ -31,15 +31,15 @@ class IdsmService : Service() {
         super.onCreate()
         queue = AlertQueue(this)
         server = ProbeSocketServer(queue)
-        uploader = MqttUploader(this, queue)
-        rules = RuleManager(this, uploader)
+        rules = RuleManager(this)
+        uploader = MqttUploader(this, queue, rules)
 
-        server.start()
-        uploader.start { topic, payload ->
-            // 云端下行:规则包分发
-            rules.onCloudMessage(topic, payload)
-        }
         rules.start()
+        server.start()
+        uploader.start { payload ->
+            // 云端下行: 签名规则包(v1.0 10.2, 单车/车型广播均已按 target 过滤)
+            rules.onCloudMessage(payload)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

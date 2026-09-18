@@ -14,7 +14,7 @@ service idsm_host_probe /vendor/bin/host_probe \
         --baseline-exec /data/data/com.idsm.manager/files/rules/current/exec.txt \
         --baseline-files /data/data/com.idsm.manager/files/rules/current/files.txt \
         --baseline-mods /data/data/com.idsm.manager/files/rules/current/mods.txt \
-        --sink @idsm_probe
+        --sink @idsm_host
     class core
     user root
     group root

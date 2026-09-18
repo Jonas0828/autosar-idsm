@@ -3,45 +3,53 @@ package com.idsm.manager
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.util.Log
-import org.json.JSONObject
 
 /**
- * ProbeSocketServer -- 监听 abstract UDS "idsm_probe",接收探针 NDJSON 行。
+ * ProbeSocketServer -- 监听 abstract UDS, 接收探针 NDJSON 行。
  *
- * host_probe / eth_probe 启动时以 root 身份 connect 到本 socket
- * (C++ 侧 --sink @idsm_probe,见 src/IdsRm_Manager.cpp sink_connect)。
- * 探针端是 fire-and-forget:APK 不在则事件丢弃,持久化责任在本组件。
+ * v1.0 起按 nodeType 分通道(与 linux/idsm_managerd 的 --socket/--sink
+ * 一一对应): @idsm_host / @idsm_eth / @idsm_can, 探针启动时以 root
+ * 身份 connect 到各自通道(C++ 侧 --sink @idsm_host 等, 见 vendor .rc)。
+ * 探针端是 fire-and-forget: APK 不在则事件丢弃, 持久化责任在本组件。
  */
 class ProbeSocketServer(private val queue: AlertQueue) {
 
     @Volatile private var running = false
-    private var thread: Thread? = null
+    private val threads = mutableListOf<Thread>()
 
     fun start() {
         running = true
-        thread = Thread({ loop() }, "idsm-probe-server").apply { start() }
+        CHANNELS.forEach { (name, nodeType) ->
+            threads += Thread({ loop(name, nodeType) }, "idsm-probe-$name")
+                .apply { start() }
+        }
     }
 
     fun stop() {
         running = false
-        // 触发 accept 退出:自连一次
-        runCatching { LocalSocket().connect(LocalServerSocket(NAME).localSocketAddress) }
-        thread?.join(1000)
+        // 触发各 accept 退出: 自连一次
+        CHANNELS.forEach { (name, _) ->
+            runCatching {
+                LocalSocket().connect(LocalServerSocket(name).localSocketAddress)
+            }
+        }
+        threads.forEach { it.join(1000) }
     }
 
-    private fun loop() {
+    private fun loop(name: String, nodeType: String) {
         while (running) {
             var server: LocalServerSocket? = null
             try {
-                server = LocalServerSocket(NAME)   // abstract namespace
-                Log.i(TAG, "listening on @$NAME")
+                server = LocalServerSocket(name)   // abstract namespace
+                Log.i(TAG, "listening on @$name ($nodeType)")
                 while (running) {
                     val conn = server.accept() ?: continue
-                    Thread({ handle(conn) }, "idsm-probe-conn").start()
+                    Thread({ handle(conn, nodeType) }, "idsm-probe-conn")
+                        .start()
                 }
             } catch (e: Exception) {
                 if (running) {
-                    Log.w(TAG, "server restart after error", e)
+                    Log.w(TAG, "server @$name restart after error", e)
                     Thread.sleep(1000)
                 }
             } finally {
@@ -50,26 +58,13 @@ class ProbeSocketServer(private val queue: AlertQueue) {
         }
     }
 
-    private fun handle(conn: LocalSocket) {
+    private fun handle(conn: LocalSocket, nodeType: String) {
         conn.inputStream.bufferedReader().use { reader ->
             while (running) {
                 val line = reader.readLine() ?: break
                 if (line.isBlank()) continue
-                try {
-                    val obj = JSONObject(line)
-                    queue.enqueue(
-                        AlertQueue.Entry(
-                            eventId = obj.optLong("event_id"),
-                            severity = obj.optString("severity"),
-                            idsMessage = obj.optString("ids_message"),
-                            payload = obj.optString("payload"),
-                            timestampS = obj.optLong("timestamp_s"),
-                            timestampNs = obj.optLong("timestamp_ns"),
-                        )
-                    )
-                } catch (e: Exception) {
-                    Log.w(TAG, "bad NDJSON line dropped: ${line.take(80)}")
-                }
+                /* 原行进队, 信封解析在发送侧(VsocEnvelope), 与 managerd 一致 */
+                queue.enqueue(nodeType, line)
             }
         }
         runCatching { conn.close() }
@@ -77,6 +72,12 @@ class ProbeSocketServer(private val queue: AlertQueue) {
 
     companion object {
         private const val TAG = "IdsmProbeServer"
-        const val NAME = "idsm_probe"
+
+        /** 通道表与 vendor .rc 中探针的 --sink 参数一致 */
+        val CHANNELS = linkedMapOf(
+            "idsm_host" to "HIDPS",
+            "idsm_eth" to "NIDPS",
+            "idsm_can" to "CIDS",
+        )
     }
 }

@@ -2,7 +2,7 @@
 # 规则路径约定同 host_probe.rc(APK device-protected 目录 + current 软链)。
 service idsm_eth_probe /vendor/bin/eth_probe -i eth0 \
         --rules /data/data/com.idsm.manager/files/rules/current/eth.rules \
-        --sink @idsm_probe
+        --sink @idsm_eth
     class core
     user root
     group root

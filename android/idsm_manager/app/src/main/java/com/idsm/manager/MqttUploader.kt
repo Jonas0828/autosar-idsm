@@ -2,41 +2,47 @@ package com.idsm.manager
 
 import android.content.Context
 import android.util.Log
+import org.eclipse.paho.client.mqttv3.IMqttMessageListener
 import org.eclipse.paho.client.mqttv3.MqttAsyncClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
 import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
-import org.json.JSONArray
-import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
 
 /**
- * MqttUploader -- MQTT/TLS 上云。
+ * MqttUploader -- MQTT 上云(VSOC 设备接入设计 v1.0 第 5/6/7/9 章),
+ * 与 linux/idsm_managerd 同协议、同 topic、同信封。
  *
- *  - 双向认证或 server-pinning 由 [buildSocketFactory] 决定(骨架默认
- *    pin 云端 broker 证书公钥 sha256,防仿冒 CA 签发的假证书)
- *  - 令牌短期有效:连接前经 [refreshToken] 换取,过期由 broker 断开触发重连
- *  - 告警 QoS1 + 本地已落库,broker ack 后才置 uploaded,语义至少一次
- *  - 断网退避重连;车机蜂窝/以太网共存时依赖系统路由,不做网络判断
- *
- * topic 规划(VIN 级隔离):
- *  上行 ids/alerts/{vin}    告警批量(JSON array)
- *  下行 ids/rules/{vin}     规则包(转 [RuleManager])
- *  上行 ids/status/{vin}    在线状态/心跳(骨架略)
+ *  - 上行: alert_{host|eth|can} 信封 -> oc/devices/{device_id}/sys/idps/...
+ *    /log (QoS1); 属性/心跳 -> sys/property/report (QoS1, 300s±10%)
+ *  - 下行: 签名规则包 sys/idps/rule/update (单车 + 车型广播) -> RuleManager
+ *  - 注册: 一型一证 init 流程(4 章), 凭据持久化, token 过期重注册;
+ *    未拿到令牌前匿名 CONNECT(带空密码会被认证插件拒绝, 同 managerd)
+ *  - LWT(5.3): CONNECT 携带 will, broker 代发置离线
+ *  - 双向认证或 server-pinning 由 [buildSocketFactory] 决定(默认 pin
+ *    云端 broker 证书公钥 sha256); 实验室明文 persist.idsm.plain=1
+ *  - 断网退避重连; 车机蜂窝/以太网共存时依赖系统路由, 不做网络判断
  */
 class MqttUploader(
     private val context: Context,
     private val queue: AlertQueue,
+    private val rules: RuleManager,
 ) {
     private val running = AtomicBoolean(false)
     private var client: MqttAsyncClient? = null
-    private var onDownlink: ((String, ByteArray) -> Unit)? = null
     private var thread: Thread? = null
 
-    fun start(onDownlink: (String, ByteArray) -> Unit) {
-        this.onDownlink = onDownlink
+    /** 规则包下行回调(网络线程); 注册响应由内部状态机处理 */
+    private var onRuleDownlink: ((ByteArray) -> Unit)? = null
+
+    private val credStore = Registration.CredentialStore(context)
+    private val creds = AtomicReference<Registration.Credentials?>()
+
+    fun start(onRuleDownlink: (ByteArray) -> Unit) {
+        this.onRuleDownlink = onRuleDownlink
         running.set(true)
         thread = Thread({ loop() }, "idsm-mqtt").apply { start() }
     }
@@ -54,6 +60,7 @@ class MqttUploader(
                 connectAndPump()
                 backoffMs = 1000L
             } catch (e: Exception) {
+                if (!running.get()) break
                 Log.w(TAG, "mqtt cycle failed, backoff ${backoffMs}ms", e)
                 Thread.sleep(backoffMs)
                 backoffMs = (backoffMs * 2).coerceAtMost(60_000)
@@ -62,49 +69,164 @@ class MqttUploader(
     }
 
     private fun connectAndPump() {
-        val c = MqttAsyncClient(
-            "ssl://${Broker.HOST}:${Broker.PORT}", clientId(),
-            MemoryPersistence()
-        )
+        resolveCredentials()
+        val c = MqttAsyncClient(brokerUrl(), transportClientId(), MemoryPersistence())
         client = c
+        val token = creds.get()?.token.orEmpty()
         val opts = MqttConnectOptions().apply {
-            userName = clientId()
-            password = refreshToken().toCharArray()
-            socketFactory = buildSocketFactory()
+            /* 未拿到令牌前保持匿名 CONNECT(带用户名但空密码会被认证插件拒绝) */
+            if (token.isNotEmpty()) {
+                userName = creds.get()?.clientId
+                password = token.toCharArray()
+            }
+            /* LWT(5.3): 属性同通道, nodeStatus=0 单节点, QoS1 retain false */
+            val primary = DeviceIdentity.nodeTypes().firstOrNull() ?: "HIDPS"
+            setWill(DeviceIdentity.propertyTopic(),
+                    PropertyReport.buildLwtPayload(primary).toByteArray(),
+                    1, false)
+            keepAliveInterval = 60
             isAutomaticReconnect = false   // 退避策略归 loop() 统一管
-            isCleanSession = false         // 未确认的 QoS1 由 broker 重发
+            isCleanSession = true
+            if (!plainText()) socketFactory = buildSocketFactory()
         }
         c.connect(opts).waitForCompletion(10_000)
-        c.subscribe("ids/rules/${vin()}", 1) { topic, msg ->
-            onDownlink?.invoke(topic, msg.payload)
-        }
-        Log.i(TAG, "connected, pumping alerts")
+        c.subscribe(DeviceIdentity.ruleTopic(), 1, ruleListener)
+        c.subscribe(DeviceIdentity.ruleBroadcastTopic(), 1, ruleListener)
+        Log.i(TAG, "connected device_id=${DeviceIdentity.deviceId()} " +
+                   "auth=${if (token.isEmpty()) "anonymous" else "token"}")
 
-        while (running.get() && c.isConnected) {
-            val batch = queue.pending(64)
-            if (batch.isEmpty()) {
-                Thread.sleep(500)
-                continue
-            }
-            val arr = JSONArray()
-            batch.forEach { (_, e) -> arr.put(JSONObject().apply {
-                put("event_id", e.eventId)
-                put("severity", e.severity)
-                put("ts_s", e.timestampS)          // 探针时间戳,见 docs/vehicle-production.md
-                put("ts_ns", e.timestampNs)
-                put("ids_message", e.idsMessage)   // 完整 IDSM 消息(hex),云端可原样入库
-                put("payload", e.payload)
-            }) }
-            val msg = MqttMessage(arr.toString().toByteArray()).apply {
-                qos = 1
-                isRetained = false
-            }
-            c.publish("ids/alerts/${vin()}", msg).waitForCompletion(10_000)
-            queue.markUploaded(batch.map { it.first })
+        /* 一型一证注册: 匿名连上后发 init 请求; 成功后断开用新凭据重连 */
+        if (needRegistration()) {
+            doRegistration(c)
+            runCatching { c.disconnect() }
+            return   // 外层 loop 以新凭据重连
+        }
+
+        pump(c)
+    }
+
+    /* ── 注册(4 章) ─────────────────────────────────────── */
+
+    private fun needRegistration(): Boolean {
+        val cli = Registration.cliToken()
+        if (cli.isNotEmpty()) return false          // 车队测试直配
+        if (!Registration.enabled()) return false   // 一机一证直连
+        return creds.get() == null                  // 无有效本地凭据
+    }
+
+    private fun resolveCredentials() {
+        val cli = Registration.cliToken()
+        if (cli.isNotEmpty()) {
+            creds.set(Registration.Credentials("idsm-${DeviceIdentity.deviceId()}", cli))
+            return
+        }
+        val (stored, err) = credStore.load()
+        if (err != null) Log.w(TAG, "credentials unreadable: $err")
+        if (stored != null && stored.validAt(System.currentTimeMillis() / 1000)) {
+            creds.set(stored)
+            Log.i(TAG, "loaded credentials for ${stored.clientId}")
         }
     }
 
-    /** TLS pinning: 只信任指定公钥指纹,忽略系统 CA 库 */
+    private fun doRegistration(c: MqttAsyncClient) {
+        val requestId = Registration.newRequestId()
+        val responseRef = AtomicReference<String?>(null)
+        c.subscribe(DeviceIdentity.initResponseTopic(requestId), 1,
+                    IMqttMessageListener { _, msg ->
+                        responseRef.set(String(msg.payload))
+                    }).waitForCompletion(10_000)   // 订阅先就绪再发请求
+        val req = Registration.buildInitRequest(requestId, System.currentTimeMillis())
+        c.publish(DeviceIdentity.initRequestTopic(requestId),
+                  MqttMessage(req.toByteArray()).apply { qos = 1 })
+            .waitForCompletion(10_000)
+        Log.i(TAG, "init request rid=$requestId")
+
+        /* 等响应 30s; 超时抛异常走外层退避重试 */
+        val deadline = System.currentTimeMillis() + 30_000
+        while (responseRef.get() == null && System.currentTimeMillis() < deadline) {
+            if (!running.get()) return
+            Thread.sleep(200)
+        }
+        val payload = responseRef.get() ?: throw java.util.concurrent
+            .TimeoutException("init response timeout")
+        val (got, err) = Registration.parseInitResponse(payload, requestId)
+        if (got == null) throw IllegalStateException("init rejected: $err")
+        val saveErr = credStore.save(got)
+        if (saveErr != null) Log.e(TAG, "credential save failed: $saveErr")
+        creds.set(got)
+        Log.i(TAG, "registered: client_id=${got.clientId}")
+    }
+
+    /* ── 上行泵: 告警信封 + 属性心跳 ─────────────────────── */
+
+    private fun pump(c: MqttAsyncClient) {
+        var nextReportMs = System.currentTimeMillis()   // CONNECT 后 5s 内全量
+        while (running.get() && c.isConnected) {
+            val now = System.currentTimeMillis()
+
+            /* 属性/心跳(8.3): 全量节点数组, 300s ± 10% 周期 */
+            if (now >= nextReportMs) {
+                val nodes = DeviceIdentity.nodeTypes().map { nt ->
+                    PropertyReport.NodeProperty(
+                        ecuCode = DeviceIdentity.ecuCode(),
+                        nodeType = nt,
+                        nodeVersion = "idsm_manager_apk/1.0.0",
+                        nodeStatus = 1,
+                        ruleVersion = rules.currentVersion(),
+                    )
+                }
+                publishQos1(c, DeviceIdentity.propertyTopic(),
+                            PropertyReport.buildReport(nodes, now))
+                nextReportMs = PropertyReport.nextReportTimeMs(now)
+                Log.i(TAG, "property report (${nodes.size} nodes)")
+            }
+
+            /* 逐 nodeType 通道: 队列批次 -> 信封 -> 发布 -> 推进游标 */
+            var any = false
+            for (nodeType in DeviceIdentity.nodeTypes()) {
+                val batch = queue.pending(nodeType, 64)
+                if (batch.isEmpty()) continue
+                any = true
+                val envelope = VsocEnvelope.buildAlertEnvelope(
+                    nodeType = nodeType,
+                    ecuCode = DeviceIdentity.ecuCode(),
+                    ruleVersion = rules.currentVersion(),
+                    rawLines = batch.map { it.raw },
+                )
+                if (envelope == null) {
+                    /* 全部解析失败: 丢批推进, 防毒丸卡死队列 */
+                    Log.e(TAG, "envelope drop batch (${batch.size} lines)")
+                    queue.markUploaded(batch.map { it.id })
+                    continue
+                }
+                publishQos1(c, DeviceIdentity.alertTopic(nodeType), envelope)
+                queue.markUploaded(batch.map { it.id })
+            }
+            if (!any && now < nextReportMs) Thread.sleep(500)
+        }
+    }
+
+    private val ruleListener = IMqttMessageListener { _, msg ->
+        onRuleDownlink?.invoke(msg.payload)
+    }
+
+    private fun publishQos1(c: MqttAsyncClient, topic: String, payload: String) {
+        c.publish(topic, MqttMessage(payload.toByteArray()).apply {
+            qos = 1
+            isRetained = false
+        }).waitForCompletion(10_000)
+    }
+
+    private fun brokerUrl(): String {
+        val scheme = if (plainText()) "tcp" else "ssl"
+        return "$scheme://${Broker.HOST}:${Broker.PORT}"
+    }
+
+    /** 实验室明文(mock 云): persist.idsm.plain=1 */
+    private fun plainText(): Boolean =
+        android.os.SystemProperties.get("persist.idsm.plain", "0") == "1"
+
+    /** TLS pinning: 只信任指定公钥指纹, 忽略系统 CA 库 */
     private fun buildSocketFactory(): SSLSocketFactory {
         val tm = PinningTrustManager(Broker.PINNED_PUBKEY_SHA256)
         return SSLContext.getInstance("TLS").apply {
@@ -112,16 +234,9 @@ class MqttUploader(
         }.socketFactory
     }
 
-    /** VIN/令牌由 OEM 集成时注入;骨架从系统属性读取 */
-    private fun vin(): String =
-        android.os.SystemProperties.get("persist.idsm.vin", "UNKNOWN_VIN")
-
-    private fun clientId(): String = "idsm-${vin()}"
-
-    private fun refreshToken(): String {
-        // TODO(OEM): 经 TLS 向令牌服务换取短期 JWT;骨架返回占位
-        return android.os.SystemProperties.get("persist.idsm.token", "")
-    }
+    /** 传输层 clientId(匿名连接同样需要; username 才是鉴权身份) */
+    private fun transportClientId(): String =
+        "idsm-${DeviceIdentity.deviceId()}"
 
     companion object {
         private const val TAG = "IdsmMqtt"

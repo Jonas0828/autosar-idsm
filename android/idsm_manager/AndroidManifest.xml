@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   IdsmManager -- 车规 IDSM 管理 APK(系统签名 + persistent)。
-  职责: 接收 host_probe / eth_probe 经 UDS(abstract @idsm_probe)上报的
+  职责: 接收 host_probe / eth_probe 经 UDS(abstract @idsm_host / @idsm_eth / @idsm_can(v1.0 分通道))上报的
   NDJSON 告警,持久排队后走 MQTT/TLS 上云;接收云端签名的规则包并分发给探针。
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">

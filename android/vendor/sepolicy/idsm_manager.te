@@ -14,7 +14,8 @@ allow idsm_manager_app node:tcp_socket node_connect;
 # 规则热更新通知 init 重启探针(属性需 property_service 注册 idsm_reload_prop)
 set_prop(idsm_manager_app, idsm_reload_prop)
 
-# 监听 abstract UDS "idsm_probe",接受探针连接
+# 监听 abstract UDS idsm_host / idsm_eth / idsm_can(v1.0 按 nodeType 分通道),
+# 接受探针连接
 allow idsm_manager_app self:unix_stream_socket { create bind listen accept read write };
 
 # 前台服务/通知
