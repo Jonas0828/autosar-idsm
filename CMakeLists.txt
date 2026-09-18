@@ -114,6 +114,12 @@ else()
 
 endif()
 
+# Linux IDSM manager daemon (probes --sink -> UDS -> MQTT/TLS cloud),
+# same wire protocol as the Android IdsmManager APK
+if(UNIX AND NOT APPLE)
+    add_subdirectory(linux/idsm_managerd)
+endif()
+
 # Tests
 include(FetchContent)
 FetchContent_Declare(
@@ -137,6 +143,13 @@ target_compile_options(test_idsrm PRIVATE -Wall -Wextra)
 include(GoogleTest)
 gtest_discover_tests(test_idsm)
 gtest_discover_tests(test_idsrm)
+
+if(TARGET idsm_managerd_lib)
+    add_executable(test_managerd tests/test_managerd.cpp)
+    target_link_libraries(test_managerd PRIVATE idsm_managerd_lib GTest::gtest_main)
+    target_compile_options(test_managerd PRIVATE -Wall -Wextra)
+    gtest_discover_tests(test_managerd)
+endif()
 
 if(TARGET eth_probe_lib)
     add_executable(test_eth_probe

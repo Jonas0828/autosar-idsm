@@ -275,8 +275,8 @@ cmake --build build-android --target host_probe
 
 On-vehicle the probe runs as a root init service and reports over the UDS
 sink instead of HTTP: see [`android/`](android/) for the manager APK,
-init `.rc` and sepolicy templates, and
-[docs/android-production.md](docs/android-production.md) for the
+init `.rc` and sepolicy templates, [`linux/`](linux/) for `idsm_managerd` and systemd units, and
+[docs/vehicle-production.md](docs/vehicle-production.md) for the
 probes → APK → MQTT/TLS → cloud architecture.
 
 **Regulatory mapping** (GB 44495-2024 / R155): malicious software
@@ -427,8 +427,8 @@ Delivery is fire-and-forget with bounded queueing (512 events) and graceful
 drain on shutdown; the APK owns persistence, so the native side stays
 dependency-free (no TLS/MQTT libraries). With `--sink` and no `--soc`, the
 HTTP path is compiled out at runtime. The Android side (manager APK, init
-`.rc`, sepolicy, MQTT/rule-update flow) lives in [`android/`](android/) —
-see [docs/android-production.md](docs/android-production.md) for the
+`.rc`, sepolicy, MQTT/rule-update flow) lives in [`android/`](android/), the Linux gateway side (native `idsm_managerd` daemon + systemd units) in [`linux/`](linux/) —
+see [docs/vehicle-production.md](docs/vehicle-production.md) for the
 full production architecture and the GB 44495-2024 mapping.
 
 ### JSON Payload Format

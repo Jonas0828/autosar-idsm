@@ -90,7 +90,7 @@ class MqttUploader(
             batch.forEach { (_, e) -> arr.put(JSONObject().apply {
                 put("event_id", e.eventId)
                 put("severity", e.severity)
-                put("ts_s", e.timestampS)          // 探针时间戳,见 docs/android-production.md
+                put("ts_s", e.timestampS)          // 探针时间戳,见 docs/vehicle-production.md
                 put("ts_ns", e.timestampNs)
                 put("ids_message", e.idsMessage)   // 完整 IDSM 消息(hex),云端可原样入库
                 put("payload", e.payload)

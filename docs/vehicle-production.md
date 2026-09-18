@@ -1,10 +1,18 @@
-# Android 量产部署架构
+# 车端量产部署架构(Android + Linux)
 
 目标形态:GB 44495-2024 / R155 上车运行。实验室的 HTTP 直连 SOC 路径
 (`--soc http://...`)只保留给台架;量产车端一律走
-**native 探针 → UDS → 系统 APK → MQTT/TLS → 云端**。
+**native 探针 → UDS → 本机管理组件 → MQTT/TLS → 云端**。
 
-## 分层
+管理组件按 OS 各一个实现,线上协议完全一致(NDJSON 行、topic 规划、
+规则包格式、Ed25519 canonical 字节序),云端不感知车型跑的是哪种 OS:
+
+| OS | 管理组件 | 位置 |
+|---|---|---|
+| Android | IdsmManager APK(平台签名/persistent) | [`android/idsm_manager/`](../android/idsm_manager/) |
+| Linux | idsm_managerd 原生守护进程 | [`linux/`](../linux/) |
+
+## 分层(Android 座舱/域控)
 
 ```
 ┌────────────────────────────────────────────────────┐
@@ -19,9 +27,28 @@
 └───────▲─────────────────────────────┬──────────────┘
         │ NDJSON (fire-and-forget)    │ 规则: files/current
 ┌───────┴──────────┐         ┌────────┴─────────────┐
+ │ host_probe(root) │         │ eth_probe(root)      │
+ │ init 拉起,10类    │         │ init 拉起,链路检测    │
+ │ 主机检测器         │         │                      │
+ └──────────────────┘         └──────────────────────┘
+```
+
+## 分层(Linux 网关/DCU)
+
+```
+┌────────────────────────────────────────────────────┐
+│ 云端: MQTT broker + 规则签名服务 + 告警存储/分析      │
+└──────────────▲───────────────────────┬─────────────┘
+               │ ids/alerts/{vin} QoS1 │ ids/rules/{vin}
+┌──────────────┴───────────────────────▼─────────────┐
+│ idsm_managerd(systemd 拉起, 普通用户, 64M 内存兜底)  │
+│  SocketServer ← UDS /run/idsm/probe.sock           │
+│  AlertQueue(JSONL+游标)  MqttUploader  RuleManager  │
+└───────▲─────────────────────────────┬──────────────┘
+        │ NDJSON (fire-and-forget)    │ rules/current
+┌───────┴──────────┐         ┌────────┴─────────────┐
 │ host_probe(root) │         │ eth_probe(root)      │
-│ init 拉起,10类    │         │ init 拉起,链路检测    │
-│ 主机检测器         │         │                      │
+│ systemd 拉起     │         │ systemd 拉起         │
 └──────────────────┘         └──────────────────────┘
 ```
 
@@ -45,10 +72,11 @@
 
 ### 规则下发(可信通道)
 1. 云端下发规则包 `{version, files{name:b64}, signature}`;
-2. APK 验 Ed25519(签名公钥内嵌 APK,换钥必须 OTA);
+2. 管理组件验 Ed25519(公钥内嵌 APK / 由 `--pubkey-b64` 注入,换钥必须 OTA);
 3. 写 `rules.new/` → fsync → rename `rules/v{version}/` →
    临时软链 + rename 切 `current`(原子,探针永远读到完整一版);
-4. 置 `idsm.reload=host/eth` 属性 → init 重启对应探针 → 读新基线;
+4. 触发探针重载:Android 置 `idsm.reload` 属性 → init restart;
+   Linux 执行 reload-cmd(`systemctl restart idsm-host-probe idsm-eth-probe`);
 5. 回滚:重新下发旧 version 的规则包即可,流程完全一致。
 
 ### 时间戳(审计合规的坑)
@@ -62,11 +90,11 @@
 
 | 要求 | 落点 |
 |---|---|
-| 安全事件实时上报 | host/eth 探针检测 → APK → MQTT QoS1;APK 死亡由 init/AMS 拉起补齐 |
-| 事件防丢失 | SQLite 持久队列 + 至少一次语义;溢出计数进探针日志 |
+| 安全事件实时上报 | host/eth 探针检测 → 管理组件 → MQTT QoS1;管理组件死亡由 init/AMS/systemd 拉起补齐 |
+| 事件防丢失 | 持久队列(SQLite / JSONL+游标)+ 至少一次语义;溢出计数进探针日志 |
 | 入侵检测能力覆盖 | host_probe 10 类检测器(见 attack-testing-guide.md)+ eth_probe 链路检测 |
-| 安全日志保护 | 探针只写 kmsg/stdout 不存盘;持久数据只在 APK 私有目录,SELinux 隔离 |
-| 组件权限最小化 | 独立 sepolicy 域;探针无网络能力,APK 无 root |
+| 安全日志保护 | 探针只写 kmsg/stdout 不存盘;持久数据在 APK 私有目录(SELinux 隔离)/ /var/lib/idsm(systemd 硬化) |
+| 组件权限最小化 | 独立 sepolicy 域;探针无网络能力,管理组件无 root |
 | 远端升级/策略更新 | 规则包经签名通道热更新,探针进程重启生效,可回滚 |
 
 ## 从实验室到量产的路径
@@ -75,5 +103,7 @@
    `attack-testing-guide.md`;
 2. 车机 bring-up:`--sink @idsm_probe` + IdsmManager(debug 签名,
    userdebug 镜像),MQTT broker 先指向内网;
-3. 量产:平台签名 APK、替换 broker/pin/签名公钥、sepolicy 合入、
+3. Linux 网关 bring-up:`linux/systemd/*.service` 安装 + stub MQTT 验证链路,
+   再装 `libmosquitto-dev` 重新 cmake 启用真实上云;
+4. 量产:平台签名 APK、替换 broker/pin/签名公钥、sepolicy 合入、
    过 vendor 检查单(`android/vendor/README.md`)。

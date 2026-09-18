@@ -1,0 +1,37 @@
+[Unit]
+Description=IDSM manager daemon (probe alerts -> MQTT/TLS cloud)
+# 探针通过 UDS 上报, managerd 必须先于探针就绪(探针断连会退避重连, 非硬依赖)
+Before=idsm-host-probe.service idsm-eth-probe.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# /usr/lib/idsm/ 安装 idsm_managerd, /etc/idsm/managerd.env 放
+# IDSMD_BROKER / IDSMD_VIN / IDSMD_TOKEN / IDSMD_PUBKEY_B64 等
+EnvironmentFile=-/etc/idsm/managerd.env
+ExecStart=/usr/lib/idsm/idsm_managerd \
+    --socket /run/idsm/probe.sock \
+    --data-dir /var/lib/idsm \
+    --rules-dir /var/lib/idsm/rules \
+    --seed-dir /etc/idsm/v0 \
+    --broker ${IDSMD_BROKER} \
+    --vin ${IDSMD_VIN} \
+    --token ${IDSMD_TOKEN} \
+    --cafile ${IDSMD_CAFILE} \
+    --pubkey-b64 ${IDSMD_PUBKEY_B64} \
+    --reload-cmd "systemctl restart idsm-host-probe.service idsm-eth-probe.service"
+RuntimeDirectory=idsm
+StateDirectory=idsm
+Restart=on-failure
+RestartSec=2
+# 自身资源兜底, 防异常拖垮网关
+MemoryMax=64M
+LimitNOFILE=256
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

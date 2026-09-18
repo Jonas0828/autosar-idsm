@@ -1,0 +1,19 @@
+[Unit]
+Description=IDSM ethernet probe (link IDS, UDS sink to idsm-managerd)
+After=idsm-managerd.service
+
+[Service]
+Type=simple
+# 网卡名按车型项目替换
+ExecStart=/usr/sbin/idsm/eth_probe -i eth0 \
+    --rules /var/lib/idsm/rules/current/eth.rules \
+    --sink /run/idsm/probe.sock
+Restart=on-failure
+RestartSec=2
+OOMScoreAdjust=-800
+MemoryMax=64M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
