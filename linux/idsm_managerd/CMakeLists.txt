@@ -6,6 +6,7 @@ add_library(idsm_managerd_lib STATIC
     socket_server.cpp
     mqtt_uploader.cpp
     rule_manager.cpp
+    vsoc_envelope.cpp
 )
 target_include_directories(idsm_managerd_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(idsm_managerd_lib PUBLIC Threads::Threads)

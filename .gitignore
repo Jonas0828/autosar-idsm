@@ -20,3 +20,4 @@ Thumbs.db
 # tool / agent noise
 .claude/
 NUL/
+__pycache__/

@@ -26,6 +26,7 @@
 #include "base64.h"
 #include "rule_manager.h"
 #include "socket_server.h"
+#include "vsoc_envelope.h"
 
 namespace fs = std::filesystem;
 
@@ -256,4 +257,81 @@ TEST(ManagerdSocket, ReceivesNdjsonLines) {
     ASSERT_EQ(lines.size(), 3u);
     EXPECT_NE(lines[0].find("\"event_id\":1"), std::string::npos);
     EXPECT_NE(lines[2].find("\"event_id\":3"), std::string::npos);
+}
+
+/* ─────────── VSOC 信封(v1.0 第 6/9 章)─────────── */
+
+TEST(ManagerdEnvelope, HostEventTypeNames) {
+    EXPECT_STREQ(idsm::hostEventTypeName(0x8021), "DT_UNKNOWN_EXEC");
+    EXPECT_STREQ(idsm::hostEventTypeName(0x8025), "DT_FILE_MOD");
+    EXPECT_STREQ(idsm::hostEventTypeName(0x802A), "DT_ROOT_SHELL");
+    EXPECT_STREQ(idsm::hostEventTypeName(0x9999), "EVT_9999");
+}
+
+TEST(ManagerdEnvelope, NodeTypeTopicSeg) {
+    EXPECT_STREQ(idsm::nodeTypeToTopicSeg("HIDPS"), "host");
+    EXPECT_STREQ(idsm::nodeTypeToTopicSeg("NIDPS"), "eth");
+    EXPECT_STREQ(idsm::nodeTypeToTopicSeg("CIDS"), "can");
+    EXPECT_STREQ(idsm::nodeTypeToTopicSeg("BOGUS"), "unknown");
+}
+
+TEST(ManagerdEnvelope, BuildsDesignCompliantEnvelope) {
+    const std::vector<std::string> lines = {
+        "{\"event_id\":32805,\"severity\":\"MEDIUM\","
+        "\"timestamp_s\":1726640000,\"timestamp_ns\":123456789,"
+        "\"ids_message\":\"2300408025ABCD\",\"payload\":\"abcd\"}",
+        "{\"event_id\":32801,\"severity\":\"HIGH\","
+        "\"timestamp_s\":1726640001,\"timestamp_ns\":0,"
+        "\"ids_message\":\"2300408021EF01\"}",
+    };
+    std::string err;
+    const std::string env = idsm::buildAlertEnvelope(
+        "caic", "caic_t99_LXXXXXXX202000001", "HIDPS", "0x01", "7",
+        lines, err);
+    ASSERT_FALSE(env.empty()) << err;
+
+    const auto j = nlohmann::json::parse(env);
+    EXPECT_EQ(j.at("msg_type"), "alert_host");
+    EXPECT_EQ(j.at("protocol_version"), "1.0");
+    EXPECT_EQ(j.at("manufacturer"), "caic");
+    const auto& content = j.at("content");
+    ASSERT_EQ(content.size(), 2u);
+
+    const auto& e0 = content[0];
+    /* eventId = device_id-HIDPS-sha256 前 32 hex, 前缀固定 */
+    EXPECT_EQ(e0.at("eventId").get<std::string>().substr(
+                  0, std::string("caic_t99_LXXXXXXX202000001-HIDPS-").size()),
+              "caic_t99_LXXXXXXX202000001-HIDPS-");
+    EXPECT_EQ(e0.at("eventType"), "DT_FILE_MOD");   /* 0x8025 */
+    EXPECT_EQ(e0.at("severity"), "MEDIUM");
+    EXPECT_EQ(e0.at("timestamp"), 1726640000123LL);  /* ns -> ms 截断 */
+    EXPECT_EQ(e0.at("ecuCode"), "0x01");
+    EXPECT_EQ(e0.at("nodeType"), "HIDPS");
+    EXPECT_EQ(e0.at("ruleVersion"), "7");
+    EXPECT_EQ(e0.at("replay"), false);
+    EXPECT_EQ(e0.at("raw").at("event_id"), 32805);
+
+    EXPECT_EQ(content[1].at("eventType"), "DT_UNKNOWN_EXEC");  /* 0x8021 */
+    EXPECT_EQ(content[1].at("severity"), "HIGH");
+}
+
+TEST(ManagerdEnvelope, EventIdDeterministicAndDistinct) {
+    const std::string did = "caic_t99_LXXXXXXX202000001";
+    const auto a = idsm::makeEventId(did, "HIDPS", "2300408025ABCD");
+    const auto b = idsm::makeEventId(did, "HIDPS", "2300408025ABCD");
+    const auto c = idsm::makeEventId(did, "HIDPS", "2300408025ABCE");
+    const auto d = idsm::makeEventId(did, "NIDPS", "2300408025ABCD");
+    EXPECT_EQ(a, b);            /* 幂等键确定性 */
+    EXPECT_NE(a, c);            /* 不同消息不同 id */
+    EXPECT_NE(a, d);            /* 不同 nodeType 不同 id */
+    EXPECT_EQ(a.size(), did.size() + 1 + 5 + 1 + 32);
+}
+
+TEST(ManagerdEnvelope, AllBadLinesRejected) {
+    std::string err;
+    const std::string env = idsm::buildAlertEnvelope(
+        "caic", "did", "HIDPS", "0x00", "1",
+        {"not json", "{\"foo\":1}"}, err);
+    EXPECT_TRUE(env.empty());
+    EXPECT_FALSE(err.empty());
 }

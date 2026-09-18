@@ -18,8 +18,9 @@ struct MqttConfig {
     int         port{8883};
     std::string vin{"UNKNOWN_VIN"};
     std::string token;      /* 短期令牌, 连接时刷新 */
+    bool        tls{true};  /* false = 实验室 tcp:// 明文(mock 云) */
     std::string cafile;     /* CA 或自签校验; pinning 见 mosquitto 实现的
-                               mosquitto_tls_insecure_set 注释 */
+                               mosquitto_tls_set 注释 */
     int         timeout_ms{10000};
 };
 
@@ -35,8 +36,9 @@ public:
     virtual void stop() = 0;
     virtual bool connected() const = 0;
 
-    /* QoS1 发布一批告警(json array 文本); 成功返回 true */
-    virtual bool publishAlerts(const std::string& json_array, std::string& err) = 0;
+    /* QoS1 发布到任意 topic(VSOC 信封/属性/事件); 成功返回 true */
+    virtual bool publish(const std::string& topic, const std::string& payload,
+                         std::string& err) = 0;
 
     static std::unique_ptr<MqttUploader> create(const MqttConfig& cfg);
 

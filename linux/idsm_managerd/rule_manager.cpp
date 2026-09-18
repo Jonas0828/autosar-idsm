@@ -42,6 +42,7 @@ bool RuleManager::seedFromImageDefaults(std::string& err) {
     std::error_code ec;
     if (fs::exists(current, ec)) return true;
     if (!fs::is_directory(m_seed_dir, ec)) return true;  /* 无出厂基线可播 */
+    fs::create_directories(m_rules_dir, ec);
 
     const fs::path v0 = fs::path(m_rules_dir) / "v0";
     fs::remove_all(v0, ec);
